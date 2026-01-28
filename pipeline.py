@@ -1,0 +1,288 @@
+"""Download + merge pipeline utilities."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+import time
+from pathlib import Path
+from typing import Awaitable, Callable, Optional
+
+import aiofiles
+import aiohttp
+from aiogram import Bot
+from aiogram.types import FSInputFile
+from yt_dlp import YoutubeDL
+
+from utils import format_bytes, format_duration, format_speed
+
+DOWNLOAD_CHUNK_SIZE = 512 * 1024
+LOGGER = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[str], Awaitable[None]]
+SyncProgressCallback = Optional[Callable[[str], None]]
+
+
+class ToolMissingError(RuntimeError):
+    pass
+
+
+def ensure_dependencies() -> None:
+    if not shutil.which("ffmpeg"):
+        raise ToolMissingError("ffmpeg not found in PATH")
+    if not shutil.which("ffprobe"):
+        raise ToolMissingError("ffprobe not found in PATH")
+
+
+def format_progress(action: str, current: int, total: Optional[int], speed: Optional[float]) -> str:
+    percent = "?"
+    eta = None
+    if total:
+        percent = f"{(current / total) * 100:.1f}%"
+        if speed:
+            eta = max((total - current) / speed, 0)
+    parts = [
+        action,
+        percent,
+        f"{format_bytes(current)}/{format_bytes(total)}",
+        format_speed(speed),
+    ]
+    if eta is not None:
+        parts.append(f"ETA {format_duration(eta)}")
+    return " ".join(parts)
+
+
+class ByteProgress:
+    def __init__(self, action: str, total: Optional[int], callback: Optional[ProgressCallback]) -> None:
+        self.action = action
+        self.total = total
+        self.callback = callback
+        self.start = time.monotonic()
+        self.last_emit = 0.0
+
+    async def emit(self, current: int, force: bool = False) -> None:
+        if not self.callback:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_emit < 0.8:
+            return
+        speed = current / max(now - self.start, 0.001)
+        text = format_progress(self.action, current, self.total, speed)
+        await self.callback(text)
+        self.last_emit = now
+
+    async def done(self) -> None:
+        if self.callback:
+            await self.callback("done")
+
+
+async def download_telegram_file(
+    bot: Bot,
+    file_id: str,
+    dest_path: Path,
+    semaphore: asyncio.Semaphore,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> None:
+    async with semaphore:
+        file = await bot.get_file(file_id)
+        if not file.file_path:
+            raise RuntimeError("Telegram file path missing")
+        url = f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
+        total = file.file_size
+        progress = ByteProgress("downloading", total, progress_cb)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                downloaded = 0
+                async with aiofiles.open(dest_path, "wb") as handle:
+                    async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                        await handle.write(chunk)
+                        downloaded += len(chunk)
+                        await progress.emit(downloaded)
+        await progress.done()
+
+
+def _run_ytdlp(
+    url: str,
+    dest_path: Path,
+    media_format: str,
+    progress_cb: SyncProgressCallback,
+    external_downloader: Optional[str],
+) -> Path:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    base_path = dest_path
+    if base_path.suffix:
+        base_path = base_path.with_suffix("")
+
+    def emit(text: str) -> None:
+        if progress_cb:
+            progress_cb(text)
+
+    def hook(status: dict) -> None:
+        if status.get("status") == "downloading":
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            downloaded = status.get("downloaded_bytes", 0)
+            speed = status.get("speed")
+            emit(format_progress("downloading", downloaded, total, speed))
+        elif status.get("status") == "finished":
+            emit("processing")
+
+    ydl_opts = {
+        "outtmpl": f"{base_path}.%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "progress_hooks": [hook],
+        "overwrites": True,
+    }
+    if media_format == "audio":
+        ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+    else:
+        ydl_opts["format"] = "bestvideo[ext=mp4]/bestvideo/best"
+    if external_downloader:
+        ydl_opts["external_downloader"] = external_downloader
+        ydl_opts["external_downloader_args"] = {
+            "aria2c": ["-x", "16", "-k", "1M", "--summary-interval=1"]
+        }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = None
+        if isinstance(info, dict):
+            requested = info.get("requested_downloads")
+            if requested:
+                filename = requested[0].get("filepath") or requested[0].get("filename")
+            if not filename:
+                filename = info.get("filepath")
+        if not filename:
+            filename = ydl.prepare_filename(info)
+    emit("done")
+    return Path(filename)
+
+
+async def download_url(
+    url: str,
+    dest_path: Path,
+    media_format: str,
+    semaphore: asyncio.Semaphore,
+    progress_cb: Optional[ProgressCallback] = None,
+    external_downloader: Optional[str] = None,
+) -> Path:
+    loop = asyncio.get_running_loop()
+
+    def sync_progress(text: str) -> None:
+        if progress_cb:
+            asyncio.run_coroutine_threadsafe(progress_cb(text), loop)
+
+    async with semaphore:
+        return await asyncio.to_thread(
+            _run_ytdlp, url, dest_path, media_format, sync_progress, external_downloader
+        )
+
+
+async def _probe_duration(path: Path) -> Optional[float]:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        return None
+    try:
+        return float(stdout.decode().strip())
+    except ValueError:
+        return None
+
+
+async def merge_stream_copy(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration_video, duration_audio = await asyncio.gather(
+        _probe_duration(video_path), _probe_duration(audio_path)
+    )
+    total_duration = None
+    if duration_video and duration_audio:
+        total_duration = min(duration_video, duration_audio)
+    else:
+        total_duration = duration_video or duration_audio
+
+    if progress_cb:
+        await progress_cb("starting")
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        "-shortest",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        str(output_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    last_emit = 0.0
+    if process.stdout:
+        async for raw in process.stdout:
+            line = raw.decode().strip()
+            if line.startswith("out_time_ms=") and total_duration:
+                current_ms = int(line.split("=", 1)[1] or 0)
+                current = current_ms / 1_000_000
+                percent = min((current / total_duration) * 100, 100)
+                now = time.monotonic()
+                if now - last_emit > 0.8 and progress_cb:
+                    await progress_cb(f"{percent:.1f}%")
+                    last_emit = now
+
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        error = stderr.decode().strip() if stderr else "ffmpeg failed"
+        LOGGER.error("ffmpeg error: %s", error)
+        raise RuntimeError(error)
+
+    if progress_cb:
+        await progress_cb("done")
+
+
+async def upload_with_progress(
+    bot: Bot,
+    chat_id: int,
+    video_path: Path,
+    caption: str,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> None:
+    async def upload_progress(current: int, total: int, *_) -> None:
+        if progress_cb:
+            await progress_cb(format_progress("uploading", current, total, None))
+
+    await bot.send_video(
+        chat_id=chat_id,
+        video=FSInputFile(str(video_path)),
+        caption=caption,
+        supports_streaming=True,
+        progress=upload_progress,
+    )
+    if progress_cb:
+        await progress_cb("done")
