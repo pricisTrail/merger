@@ -278,6 +278,7 @@ async def cmd_help(message: types.Message) -> None:
         "MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO.\n\n"
         "I will download, merge (stream copy), and upload the result.\n"
         "Batch: /links to send links.txt.\n"
+        "Active status: /status\n"
         "Cancel all my jobs: /stop"
     )
 
@@ -294,7 +295,32 @@ async def cmd_links(message: types.Message) -> None:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Waiting state cleared (if you were sending audio/video separately). Active background jobs keep running. Use /stop to kill all tasks.")
+    await message.answer("Waiting state cleared (if you were sending audio/video separately). Active background jobs keep running. Use /status to see jobs or /stop to kill all.")
+
+
+@router.message(Command("status"))
+async def cmd_status(message: types.Message) -> None:
+    chat_id = message.chat.id
+    tasks = ACTIVE_TASKS.get(chat_id, [])
+    
+    if not tasks:
+        await message.answer("✅ **No active jobs** for this chat.")
+        return
+    
+    # Simple resource usage check if possible
+    try:
+        import psutil
+        usage = f"🖥 **System Load**: {psutil.cpu_percent()}% | **RAM**: {psutil.virtual_memory().percent}%"
+    except ImportError:
+        usage = "🖥 System tracking not available"
+
+    text = (
+        f"📊 **Job Status for {message.from_user.first_name}**\n\n"
+        f"🏃 **Active Tasks**: {len(tasks)}\n"
+        f"{usage}\n\n"
+        "Use the progress message sent earlier for detailed live updates."
+    )
+    await message.answer(text, parse_mode="Markdown")
 
 
 @router.message(Command("stop"))

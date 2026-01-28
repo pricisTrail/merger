@@ -5,3 +5,4 @@ aiofiles>=23.2.1
 yt-dlp>=2024.12.0
 pyrogram>=2.0.106
 tgcrypto>=1.2.5
+psutil>=5.9.8

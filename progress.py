@@ -12,6 +12,24 @@ from aiogram.exceptions import TelegramBadRequest
 EDIT_THROTTLE_SECONDS = 1.0
 MAX_PROGRESS_LINES = 14
 
+def get_progress_bar(text: str) -> str:
+    """Extracts percentage from text and returns a visual bar or empty string."""
+    if not text or "%" not in text:
+        return ""
+    try:
+        # Match percentage like 45.2% or 45%
+        import re
+        match = re.search(r"(\d+\.?\d*)%", text)
+        if not match:
+            return ""
+        percentage = float(match.group(1))
+        # Create a 10-char bar
+        filled = int(percentage // 10)
+        bar = "▰" * filled + "▱" * (10 - filled)
+        return f"\n      └ {bar} {percentage:.1f}%"
+    except Exception:
+        return ""
+
 
 @dataclass
 class JobStatus:
@@ -67,14 +85,28 @@ class ProgressTracker:
             self._last_edit = time.monotonic()
 
     def render(self) -> str:
-        lines = [f"MERGE STATUS: {self.title}"]
+        lines = [f"✨ **{self.title}**"]
         for job_id, job in self.jobs.items():
-            lines.append(f"{job_id}. {job.name}")
-            lines.append(
-                f"   V: {job.video} | A: {job.audio} | M: {job.merge} | U: {job.upload}"
-            )
+            lines.append(f"📦 **{job_id}. {job.name}**")
+            
+            # Create sub-status lines
+            v_bar = get_progress_bar(job.video)
+            a_bar = get_progress_bar(job.audio)
+            m_bar = get_progress_bar(job.merge)
+            u_bar = get_progress_bar(job.upload)
+            
+            lines.append(f"   🔹 V: `{job.video or 'queued'}`")
+            if v_bar: lines.append(v_bar)
+            lines.append(f"   🔹 A: `{job.audio or 'queued'}`")
+            if a_bar: lines.append(a_bar)
+            lines.append(f"   🔹 M: `{job.merge or 'queued'}`")
+            if m_bar: lines.append(m_bar)
+            lines.append(f"   🔹 U: `{job.upload or 'queued'}`")
+            if u_bar: lines.append(u_bar)
+            lines.append("") # Spacer
+            
         if len(lines) > MAX_PROGRESS_LINES:
-            remaining = len(lines) - MAX_PROGRESS_LINES + 1
-            lines = lines[: MAX_PROGRESS_LINES - 1]
-            lines.append(f"... and {remaining} more lines")
+            # Note: with bars, we might hit the limit faster
+            lines = lines[:MAX_PROGRESS_LINES]
+            lines.append("... (more jobs below)")
         return "\n".join(lines)
