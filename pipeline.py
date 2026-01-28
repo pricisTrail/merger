@@ -191,15 +191,18 @@ async def _run_aria2c(
     # Progress parsing for aria2c (simplified)
     if process.stdout:
         async for raw in process.stdout:
-            line = raw.decode().strip()
-            if "[" in line and "]" in line and "(" in line and ")" in line:
-                # Example aria2c output: [#2089b0 1.2MiB/4.5MiB(27%) CN:1 DL:2.1MiB ETA:1s]
-                if progress_cb:
-                    await progress_cb(line)
+            try:
+                line = raw.decode("utf-8", "ignore").strip()
+                if "[" in line and "]" in line and "(" in line and ")" in line:
+                    # Example aria2c output: [#2089b0 1.2MiB/4.5MiB(27%) CN:1 DL:2.1MiB ETA:1s]
+                    if progress_cb:
+                        await progress_cb(line)
+            except Exception:
+                continue
 
     stdout, stderr = await process.communicate()
     if process.returncode != 0:
-        error = stderr.decode().strip() if stderr else "aria2c failed"
+        error = stderr.decode("utf-8", "ignore").strip() if stderr else "aria2c failed"
         raise RuntimeError(error)
     
     return dest_path

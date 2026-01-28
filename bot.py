@@ -298,7 +298,8 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
 
 @router.message(F.video)
 async def handle_video(message: types.Message, state: FSMContext) -> None:
-    if await state.get_state() != MergeStates.waiting_video.state:
+    current_state = await state.get_state()
+    if current_state != MergeStates.waiting_video:
         await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
         return
     video = message.video
@@ -320,7 +321,7 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
         return
     current_state = await state.get_state()
     if is_video_document(document):
-        if current_state == MergeStates.waiting_video.state:
+        if current_state == MergeStates.waiting_video:
             await start_video_flow(message, state, document.file_id, document.file_name or "video.mp4")
             return
         await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
@@ -339,8 +340,9 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
 
 @router.message(F.text)
 async def handle_text(message: types.Message, state: FSMContext) -> None:
-    if await state.get_state() == MergeStates.waiting_audio.state:
-        await message.answer("Waiting for audio file. Send audio to continue.")
+    current_state = await state.get_state()
+    if current_state == MergeStates.waiting_video:
+        await message.answer("Waiting for video file. Send video to continue.")
         return
     text = message.text or ""
     jobs = parse_links_text(text)
@@ -349,7 +351,7 @@ async def handle_text(message: types.Message, state: FSMContext) -> None:
         task = asyncio.create_task(process_link_jobs(message.bot, message, jobs))
         track_task(message.chat.id, task)
         return
-    await message.answer("Send a video file or /links for batch mode.")
+    await message.answer("Send an audio file or /links for batch mode.")
 
 
 async def handle_links_file(message: types.Message, document: types.Document) -> None:
