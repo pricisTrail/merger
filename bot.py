@@ -395,19 +395,25 @@ def main() -> None:
 
     async def _set_webhook_background() -> None:
         try:
+            LOGGER.info("Setting webhook to %s ...", webhook_full)
             await asyncio.wait_for(
-                bot.set_webhook(webhook_full, secret_token=webhook_secret),
-                timeout=12,
+                bot.set_webhook(
+                    webhook_full, 
+                    secret_token=webhook_secret if webhook_secret else None,
+                    drop_pending_updates=True
+                ),
+                timeout=15,
             )
-            LOGGER.info("Webhook set to %s", webhook_full)
+            info = await bot.get_webhook_info()
+            LOGGER.info("Webhook set successfully! Current info: %s", info)
         except Exception as exc:
-            LOGGER.exception("Failed to set webhook to %s", webhook_full, exc_info=exc)
+            LOGGER.exception("CRITICAL: Failed to set webhook to %s", webhook_full, exc_info=exc)
 
     async def on_startup(*_args, **_kwargs) -> None:
         asyncio.create_task(_set_webhook_background())
 
     async def on_shutdown(*_args, **_kwargs) -> None:
-        await bot.delete_webhook(drop_pending_updates=False)
+        LOGGER.info("Shutting down...")
         await bot.session.close()
 
     dp.startup.register(on_startup)
