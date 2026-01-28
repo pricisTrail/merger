@@ -160,6 +160,51 @@ def _run_ytdlp(
     return Path(filename)
 
 
+async def _run_aria2c(
+    url: str,
+    dest_path: Path,
+    progress_cb: Optional[ProgressCallback],
+) -> Path:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    # Use a temporary name to avoid conflicts, then rename based on what aria2c actually downloads
+    # Or better, just specify the output file name if we can.
+    # But often we don't know the extension.
+    
+    cmd = [
+        "aria2c",
+        url,
+        "--dir", str(dest_path.parent),
+        "--out", dest_path.name,
+        "--allow-overwrite=true",
+        "--max-connection-per-server=16",
+        "--split=16",
+        "--min-split-size=1M",
+        "--summary-interval=1",
+    ]
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    
+    # Progress parsing for aria2c (simplified)
+    if process.stdout:
+        async for raw in process.stdout:
+            line = raw.decode().strip()
+            if "[" in line and "]" in line and "(" in line and ")" in line:
+                # Example aria2c output: [#2089b0 1.2MiB/4.5MiB(27%) CN:1 DL:2.1MiB ETA:1s]
+                if progress_cb:
+                    await progress_cb(line)
+
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        error = stderr.decode().strip() if stderr else "aria2c failed"
+        raise RuntimeError(error)
+    
+    return dest_path
+
+
 async def download_url(
     url: str,
     dest_path: Path,
@@ -175,6 +220,15 @@ async def download_url(
             asyncio.run_coroutine_threadsafe(progress_cb(text), loop)
 
     async with semaphore:
+        # Try aria2c first if it's available
+        if shutil.which("aria2c"):
+            try:
+                LOGGER.info("Trying aria2c for %s", url)
+                return await _run_aria2c(url, dest_path, progress_cb)
+            except Exception as exc:
+                LOGGER.warning("aria2c failed, falling back to yt-dlp: %s", exc)
+        
+        # Fallback to yt-dlp
         return await asyncio.to_thread(
             _run_ytdlp, url, dest_path, media_format, sync_progress, external_downloader
         )

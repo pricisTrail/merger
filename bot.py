@@ -239,23 +239,23 @@ async def process_link_jobs(bot: Bot, message: types.Message, jobs: List[LinkJob
     await asyncio.gather(*tasks)
 
 
-async def start_video_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
-    await state.update_data(video_id=file_id, video_name=name)
-    await state.set_state(MergeStates.waiting_audio)
-    await message.answer("Video received. Now send the audio file.")
-
-
 async def start_audio_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
+    await state.update_data(audio_id=file_id, audio_name=name)
+    await state.set_state(MergeStates.waiting_video)
+    await message.answer("Audio received. Now send the video file.")
+
+
+async def start_video_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
     data = await state.get_data()
-    video_id = data.get("video_id")
-    video_name = data.get("video_name")
-    if not video_id:
-        await message.answer("Please send a video first.")
+    audio_id = data.get("audio_id")
+    audio_name = data.get("audio_name")
+    if not audio_id:
+        await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
         return
     await state.clear()
     await message.answer("Processing merge. Progress will appear below.")
     task = asyncio.create_task(
-        process_single_merge(message.bot, message.chat.id, video_id, file_id, video_name, name)
+        process_single_merge(message.bot, message.chat.id, file_id, audio_id, name, audio_name)
     )
     track_task(message.chat.id, task)
 
@@ -263,7 +263,8 @@ async def start_audio_flow(message: types.Message, state: FSMContext, file_id: s
 @router.message(CommandStart())
 async def cmd_start(message: types.Message) -> None:
     await message.answer(
-        "Send a video file, then an audio file to merge without re-encoding.\n"
+        "Send an audio file, then a video file to merge without re-encoding.\n"
+        "MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO.\n"
         "For batch mode, send /links and upload links.txt with audio/video/name entries."
     )
 
@@ -272,8 +273,9 @@ async def cmd_start(message: types.Message) -> None:
 async def cmd_help(message: types.Message) -> None:
     await message.answer(
         "Flow:\n"
-        "1) Send a video file.\n"
-        "2) Send an audio file.\n"
+        "1) Send an audio file.\n"
+        "2) Send a video file.\n"
+        "MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO.\n\n"
         "I will download, merge (stream copy), and upload the result.\n"
         "Batch: /links to send links.txt."
     )
@@ -296,6 +298,9 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
 
 @router.message(F.video)
 async def handle_video(message: types.Message, state: FSMContext) -> None:
+    if await state.get_state() != MergeStates.waiting_video.state:
+        await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
+        return
     video = message.video
     name = video.file_name or f"video_{message.message_id}.mp4"
     await start_video_flow(message, state, video.file_id, name)
@@ -303,9 +308,6 @@ async def handle_video(message: types.Message, state: FSMContext) -> None:
 
 @router.message(F.audio)
 async def handle_audio(message: types.Message, state: FSMContext) -> None:
-    if await state.get_state() != MergeStates.waiting_audio.state:
-        await message.answer("Please send a video first.")
-        return
     audio = message.audio
     name = audio.file_name or f"audio_{message.message_id}.mp3"
     await start_audio_flow(message, state, audio.file_id, name)
@@ -317,14 +319,14 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
     if not document:
         return
     current_state = await state.get_state()
-    if is_audio_document(document):
-        if current_state == MergeStates.waiting_audio.state:
-            await start_audio_flow(message, state, document.file_id, document.file_name or "audio")
-            return
-        await message.answer("Please send a video first.")
-        return
     if is_video_document(document):
-        await start_video_flow(message, state, document.file_id, document.file_name or "video.mp4")
+        if current_state == MergeStates.waiting_video.state:
+            await start_video_flow(message, state, document.file_id, document.file_name or "video.mp4")
+            return
+        await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
+        return
+    if is_audio_document(document):
+        await start_audio_flow(message, state, document.file_id, document.file_name or "audio")
         return
     if document.file_name and document.file_name.lower().endswith(".txt"):
         await handle_links_file(message, document)
@@ -332,7 +334,7 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
     if document.mime_type == "text/plain":
         await handle_links_file(message, document)
         return
-    await message.answer("Unsupported document type. Send video/audio or links.txt.")
+    await message.answer("Unsupported document type. Send video/audio or links.txt. , MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
 
 
 @router.message(F.text)
