@@ -193,14 +193,21 @@ async def _run_aria2c(
         async for raw in process.stdout:
             try:
                 line = raw.decode("utf-8", "ignore").strip()
-                if "[" in line and "]" in line and "(" in line and ")" in line:
-                    # Example aria2c output: [#2089b0 1.2MiB/4.5MiB(27%) CN:1 DL:2.1MiB ETA:1s]
+                # Example aria2c output: [#2089b0 1.2MiB/4.5MiB(27%) CN:1 DL:2.1MiB ETA:1s]
+                # We want to extract the part between [ ]
+                if line.startswith("[") and "]" in line:
+                    status_line = line[line.find("[")+1 : line.find("]")]
                     if progress_cb:
-                        await progress_cb(line)
+                        await progress_cb(status_line)
+                elif "download completed" in line.lower():
+                    if progress_cb:
+                        await progress_cb("done")
             except Exception:
                 continue
 
     stdout, stderr = await process.communicate()
+    if progress_cb:
+        await progress_cb("done")
     if process.returncode != 0:
         error = stderr.decode("utf-8", "ignore").strip() if stderr else "aria2c failed"
         raise RuntimeError(error)
@@ -330,16 +337,22 @@ async def upload_with_progress(
     caption: str,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
-    async def upload_progress(current: int, total: int, *_) -> None:
+    # Basic upload without progress first to ensure stability
+    # Aiogram 3.x doesn't support progress callbacks for FSInputFile easily.
+    # We will use the built-in way which is stable.
+    try:
         if progress_cb:
-            await progress_cb(format_progress("uploading", current, total, None))
-
-    await bot.send_video(
-        chat_id=chat_id,
-        video=FSInputFile(str(video_path)),
-        caption=caption,
-        supports_streaming=True,
-        progress=upload_progress,
-    )
-    if progress_cb:
-        await progress_cb("done")
+            await progress_cb("starting")
+        
+        await bot.send_video(
+            chat_id=chat_id,
+            video=FSInputFile(str(video_path)),
+            caption=caption,
+            supports_streaming=True,
+        )
+        if progress_cb:
+            await progress_cb("done")
+    except Exception as e:
+        if progress_cb:
+            await progress_cb(f"failed: {str(e)}")
+        raise e
