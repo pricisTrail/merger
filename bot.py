@@ -316,12 +316,12 @@ async def start_video_flow(message: types.Message, state: FSMContext, file_id: s
 @router.message(CommandStart())
 async def cmd_start(message: types.Message) -> None:
     await message.answer(
-        "🚀 **Telegram Multi-Merger Bot**\n\n"
+        "🚀 <b>Telegram Multi-Merger Bot</b>\n\n"
         "I can merge video and audio without re-encoding!\n\n"
-        "🔹 **/single** - Merge one pair step-by-step.\n"
-        "🔹 **/links** - Batch merge using links.txt.\n"
-        "🔹 **/status** - Check active jobs.\n"
-        "🔹 **/stop** - Stop all active jobs."
+        "🔹 <b>/single</b> — Merge one pair step-by-step.\n"
+        "🔹 <b>/links</b> — Batch merge using links.txt.\n"
+        "🔹 <b>/status</b> — Check active jobs.\n"
+        "🔹 <b>/stop</b> — Stop all active jobs."
     )
 
 
@@ -342,11 +342,11 @@ async def cmd_help(message: types.Message) -> None:
 @router.message(Command("links"))
 async def cmd_links(message: types.Message) -> None:
     await message.answer(
-        "📂 **Batch Mode Configuration**\n\n"
-        "Send a `.txt` file or paste text in this format:\n\n"
-        "`audio - <link>`\n"
-        "`video - <link>`\n"
-        "`name  - <name>.mp4`"
+        "📂 <b>Batch Mode Configuration</b>\n\n"
+        "Send a <code>.txt</code> file or paste text in this format:\n\n"
+        "<code>audio - &lt;link&gt;</code>\n"
+        "<code>video - &lt;link&gt;</code>\n"
+        "<code>name  - &lt;name&gt;.mp4</code>"
     )
 
 
@@ -362,23 +362,22 @@ async def cmd_status(message: types.Message) -> None:
     tasks = ACTIVE_TASKS.get(chat_id, [])
     
     if not tasks:
-        await message.answer("✅ **No active jobs** for this chat.")
+        await message.answer("✅ <b>No active jobs</b> for this chat.")
         return
     
-    # Simple resource usage check if possible
     try:
         import psutil
-        usage = f"🖥 **System Load**: {psutil.cpu_percent()}% | **RAM**: {psutil.virtual_memory().percent}%"
+        usage = f"🖥 <b>System Load</b>: {psutil.cpu_percent()}% | <b>RAM</b>: {psutil.virtual_memory().percent}%"
     except ImportError:
         usage = "🖥 System tracking not available"
 
     text = (
-        f"📊 **Job Status for {message.from_user.first_name}**\n\n"
-        f"🏃 **Active Tasks**: {len(tasks)}\n"
+        f"📊 <b>Job Status for {message.from_user.first_name}</b>\n\n"
+        f"🏃 <b>Active Tasks</b>: {len(tasks)}\n"
         f"{usage}\n\n"
-        "Use the progress message sent earlier for detailed live updates."
+        "<i>Use the progress message sent earlier for detailed live updates.</i>"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("stop"))
@@ -518,7 +517,7 @@ def main() -> None:
 
     bot = Bot(
         token=token,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = build_dispatcher()
 
