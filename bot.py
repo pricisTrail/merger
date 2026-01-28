@@ -597,6 +597,28 @@ async def handle_links_file(message: types.Message, document: types.Document) ->
     task = asyncio.create_task(process_link_jobs(message.bot, message, jobs))
     track_task(message.chat.id, task)
 
+@router.callback_query(F.data.startswith("page_"))
+async def handle_pagination(callback: types.CallbackQuery) -> None:
+    data = callback.data
+    chat_id = int(data.split("_")[-1])
+    action = data.split("_")[1] # prev or next
+    
+    trackers = ACTIVE_TRACKERS.get(chat_id, [])
+    if not trackers:
+        await callback.answer("❌ Status tracker no longer active.")
+        return
+        
+    # We navigate the latest tracker for that chat
+    tracker = trackers[-1]
+    total = len(tracker.jobs)
+    
+    if action == "prev":
+        tracker.current_page = (tracker.current_page - 1) % total
+    elif action == "next":
+        tracker.current_page = (tracker.current_page + 1) % total
+
+    await tracker.refresh(force=True)
+    await callback.answer()
 
 def main() -> None:
     load_dotenv()

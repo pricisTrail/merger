@@ -6,8 +6,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from aiogram import Bot
+from aiogram import Bot, types
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 EDIT_THROTTLE_SECONDS = 1.0
 MAX_PROGRESS_LINES = 20
@@ -31,13 +32,24 @@ def get_premium_status(stage: str, text: str) -> str:
     filled = int(percentage // 10)
     bar = "🟧" * filled + "⬜" * (10 - filled)
     
+    # Header for the block
+    header = f"\n     📁 {stage} 📁 "
+    
+    # Mode logic
+    mode = "Download"
+    if stage == "Merge": mode = "Merging"
+    if stage == "Upload": mode = "Upload"
+
     card = [
+        header,
         f"   ✦ {bar} ✦",
         f"   » 🔋 Percentage • {percentage:.1f}%",
     ]
     if spd: card.append(f"   » 🚀 Speed • {spd.group(1)}")
     if sz: card.append(f"   » 🚦 Size • {sz.group(1)}")
     if eta: card.append(f"   » ⏰ ETA • {eta.group(1)}")
+    
+    card.append(f"   » Mode: {mode}")
     
     return "\n".join(card)
 
@@ -60,11 +72,16 @@ class ProgressTracker:
         self.jobs: "OrderedDict[int, JobStatus]" = OrderedDict()
         self._lock = asyncio.Lock()
         self._last_edit = 0.0
+        self.current_page = 0 # 0-indexed
 
     async def start(self) -> None:
         if self.message_id is not None:
             return
-        message = await self.bot.send_message(self.chat_id, self.render())
+        message = await self.bot.send_message(
+            self.chat_id, 
+            self.render(), 
+            reply_markup=self.get_markup()
+        )
         self.message_id = message.message_id
 
     def add_job(self, job_id: int, name: str) -> None:
@@ -89,6 +106,7 @@ class ProgressTracker:
                     text=text,
                     chat_id=self.chat_id,
                     message_id=self.message_id,
+                    reply_markup=self.get_markup()
                 )
             except TelegramBadRequest as exc:
                 if "message is not modified" not in str(exc).lower():
@@ -96,17 +114,42 @@ class ProgressTracker:
             self._last_edit = time.monotonic()
 
     def render(self) -> str:
-        lines = [f"📥 {self.title}\n"]
-        for job_id, job in self.jobs.items():
-            lines.append(f"📁 {job_id}. {job.name}")
-            
-            lines.append(get_premium_status("Video", job.video))
-            lines.append(get_premium_status("Audio", job.audio))
-            lines.append(get_premium_status("Merge", job.merge))
-            lines.append(get_premium_status("Upload", job.upload))
-            lines.append("") # Spacer
-            
-        if len(lines) > MAX_PROGRESS_LINES:
-            lines = lines[:MAX_PROGRESS_LINES]
-            lines.append("... (more)")
+        job_ids = list(self.jobs.keys())
+        total_jobs = len(job_ids)
+        if total_jobs == 0:
+            return f"📥 {self.title}\nWaiting for jobs..."
+        
+        # Ensure page is in range
+        if self.current_page >= total_jobs:
+            self.current_page = total_jobs - 1
+        if self.current_page < 0:
+            self.current_page = 0
+
+        job_id = job_ids[self.current_page]
+        job = self.jobs[job_id]
+        
+        lines = [
+            f"📥 {self.title}",
+            f"🗄 {self.current_page + 1} / {total_jobs}",
+            f"📁 {job.name}\n"
+        ]
+        
+        lines.append(get_premium_status("Video", job.video))
+        lines.append(get_premium_status("Audio", job.audio))
+        lines.append(get_premium_status("Merge", job.merge))
+        lines.append(get_premium_status("Upload", job.upload))
+        
         return "\n".join(lines)
+
+    def get_markup(self) -> Optional[types.InlineKeyboardMarkup]:
+        total_jobs = len(self.jobs)
+        if total_jobs <= 1:
+            return None
+            
+        builder = InlineKeyboardBuilder()
+        # Prev [Page/Total] Next
+        builder.button(text="⏪ Prev", callback_data=f"page_prev_{self.chat_id}")
+        builder.button(text=f"{self.current_page + 1} / {total_jobs}", callback_data="noop")
+        builder.button(text="Next ⏩", callback_data=f"page_next_{self.chat_id}")
+        builder.adjust(3)
+        return builder.as_markup()
