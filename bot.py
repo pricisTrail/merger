@@ -371,22 +371,36 @@ def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN missing")
-    if not WEBHOOK_URL:
+    webhook_url = os.getenv("WEBHOOK_URL")
+    webhook_path_env = os.getenv("WEBHOOK_PATH", "/webhook")
+    webhook_secret = os.getenv("WEBHOOK_SECRET")
+    port = int(os.getenv("PORT", "8000"))
+    if not webhook_url:
         raise RuntimeError("WEBHOOK_URL missing (public base url, e.g. https://<app>.koyeb.app)")
     try:
         ensure_dependencies()
     except ToolMissingError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    webhook_base = WEBHOOK_URL.rstrip("/")
-    webhook_path = WEBHOOK_PATH if WEBHOOK_PATH.startswith("/") else f"/{WEBHOOK_PATH}"
+    webhook_base = webhook_url.rstrip("/")
+    webhook_path = webhook_path_env if webhook_path_env.startswith("/") else f"/{webhook_path_env}"
     webhook_full = f"{webhook_base}{webhook_path}"
 
     bot = Bot(token=token)
     dp = build_dispatcher()
 
+    async def _set_webhook_background() -> None:
+        try:
+            await asyncio.wait_for(
+                bot.set_webhook(webhook_full, secret_token=webhook_secret),
+                timeout=12,
+            )
+            LOGGER.info("Webhook set to %s", webhook_full)
+        except Exception as exc:
+            LOGGER.exception("Failed to set webhook to %s", webhook_full, exc_info=exc)
+
     async def on_startup(_: Dispatcher) -> None:
-        await bot.set_webhook(webhook_full, secret_token=WEBHOOK_SECRET)
+        asyncio.create_task(_set_webhook_background())
 
     async def on_shutdown(_: Dispatcher) -> None:
         await bot.delete_webhook(drop_pending_updates=False)
@@ -405,10 +419,10 @@ def main() -> None:
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
-        secret_token=WEBHOOK_SECRET,
+        secret_token=webhook_secret,
     ).register(app, path=webhook_path)
     setup_application(app, dp, bot=bot)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
