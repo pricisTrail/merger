@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import time
 from pathlib import Path
@@ -195,12 +196,34 @@ async def _run_aria2c(
         async for raw in process.stdout:
             try:
                 line = raw.decode("utf-8", "ignore").strip()
-                # Example aria2c output: [#2089b0 1.2MiB/4.5MiB(27%) CN:1 DL:2.1MiB ETA:1s]
-                # We want to extract the part between [ ]
-                if line.startswith("[") and "]" in line:
-                    status_line = line[line.find("[")+1 : line.find("]")]
-                    if progress_cb:
-                        await progress_cb(status_line)
+                # Example aria2c output: [#b037be 1.1GiB/1.1GiB(99%) CN:1 DL:2.8MiB ETA:13s]
+                # We want: 99% 1.1GiB/1.1GiB 2.8MiB/s ETA 13s
+                if "[" in line and "]" in line and "(" in line in line:
+                    try:
+                        # Extract percentage: (99%)
+                        percent_match = re.search(r"\((\d+%)\)", line)
+                        percent = percent_match.group(1) if percent_match else ""
+                        
+                        # Extract sizes: 1.1GiB/1.1GiB
+                        size_match = re.search(r"(\d+\.?\d*[KMGT]i?B/\d+\.?\d*[KMGT]i?B)", line)
+                        sizes = size_match.group(1) if size_match else ""
+                        
+                        # Extract speed: DL:2.8MiB
+                        speed_match = re.search(r"DL:(\d+\.?\d*[KMGT]i?B)", line)
+                        speed = f"{speed_match.group(1)}/s" if speed_match else ""
+                        
+                        # Extract ETA: ETA:13s
+                        eta_match = re.search(r"ETA:(\w+)", line)
+                        eta = f"ETA {eta_match.group(1)}" if eta_match else ""
+                        
+                        text = f"{percent} {sizes} {speed} {eta}".strip()
+                        if text and progress_cb:
+                            await progress_cb(text)
+                    except Exception:
+                        # Fallback to cleaned raw line if regex fails
+                        status_line = line[line.find("[")+1 : line.find("]")]
+                        if progress_cb:
+                            await progress_cb(status_line)
                 elif "download completed" in line.lower():
                     if progress_cb:
                         await progress_cb("done")
@@ -246,26 +269,70 @@ async def download_url(
         )
 
 
-async def _probe_duration(path: Path) -> Optional[float]:
-    process = await asyncio.create_subprocess_exec(
+async def _probe_video_info(path: Path) -> dict:
+    """Returns duration, width, height or empty dict if probe fails."""
+    cmd = [
         "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=nokey=1:noprint_wrappers=1",
-        str(path),
+        "-v", "error",
+        "-show_entries", "format=duration:stream=width,height",
+        "-of", "json",
+        str(path)
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, _ = await process.communicate()
     if process.returncode != 0:
-        return None
+        return {}
+    
+    import json
     try:
-        return float(stdout.decode().strip())
-    except ValueError:
-        return None
+        data = json.loads(stdout.decode())
+        format_info = data.get("format", {})
+        streams = data.get("streams", [])
+        video_stream = next((s for s in streams if s.get("width")), {})
+        
+        return {
+            "duration": int(float(format_info.get("duration", 0))),
+            "width": int(video_stream.get("width", 0)),
+            "height": int(video_stream.get("height", 0)),
+        }
+    except (ValueError, KeyError, StopIteration, TypeError):
+        return {}
+
+
+async def _generate_thumb(video_path: Path) -> Optional[Path]:
+    """Generates a thumbnail for the video at 10% of its duration."""
+    info = await _probe_video_info(video_path)
+    duration = info.get("duration", 0)
+    offset = max(1, int(duration * 0.1))
+    
+    thumb_path = video_path.with_suffix(".jpg")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(offset),
+        "-i", str(video_path),
+        "-vframes", "1",
+        "-q:v", "2",
+        str(thumb_path)
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await process.communicate()
+    if process.returncode == 0:
+        return thumb_path
+    return None
+
+
+async def _probe_duration(path: Path) -> Optional[float]:
+    info = await _probe_video_info(path)
+    return float(info["duration"]) if "duration" in info else None
 
 
 async def merge_stream_copy(
@@ -366,8 +433,16 @@ async def upload_with_progress(
     # Use Pyrogram for large files
     try:
         if progress_cb:
-            await progress_cb("initializing uploader")
+            await progress_cb("preparing metadata")
         
+        # Extract metadata for better Telegram display
+        info = await _probe_video_info(video_path)
+        thumb_path = await _generate_thumb(video_path)
+        
+        duration = info.get("duration", 0)
+        width = info.get("width", 0)
+        height = info.get("height", 0)
+
         async with Client(
             name=f"uploader_{chat_id}",
             api_id=int(api_id),
@@ -387,8 +462,15 @@ async def upload_with_progress(
                 video=str(video_path),
                 caption=caption,
                 supports_streaming=True,
+                duration=duration,
+                width=width,
+                height=height,
+                thumb=str(thumb_path) if thumb_path else None,
                 progress=pyrogram_progress
             )
+            
+        if thumb_path:
+            thumb_path.unlink(missing_ok=True)
             
         if progress_cb:
             await progress_cb("done")

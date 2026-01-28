@@ -277,7 +277,8 @@ async def cmd_help(message: types.Message) -> None:
         "2) Send a video file.\n"
         "MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO.\n\n"
         "I will download, merge (stream copy), and upload the result.\n"
-        "Batch: /links to send links.txt."
+        "Batch: /links to send links.txt.\n"
+        "Cancel all my jobs: /stop"
     )
 
 
@@ -293,7 +294,23 @@ async def cmd_links(message: types.Message) -> None:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Waiting state cleared. Active jobs keep running.")
+    await message.answer("Waiting state cleared (if you were sending audio/video separately). Active background jobs keep running. Use /stop to kill all tasks.")
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: types.Message) -> None:
+    chat_id = message.chat.id
+    tasks = ACTIVE_TASKS.get(chat_id, [])
+    if not tasks:
+        await message.answer("No active jobs found for this chat.")
+        return
+    
+    count = len(tasks)
+    for task in tasks:
+        task.cancel()
+    
+    # Logic in track_task will handle removing them from the list
+    await message.answer(f"Cancelled {count} active job(s). Cleanup might take a few seconds.")
 
 
 @router.message(F.video)
