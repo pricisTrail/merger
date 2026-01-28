@@ -32,6 +32,10 @@ Optional:
 - `KEEP_FILES=0`
 
 ## Run
+This repo is configured to run as a **webhook webservice** (not polling).
+
+For local testing you need a public HTTPS URL (e.g. Cloudflare Tunnel / ngrok) and set `WEBHOOK_URL`.
+
 ```bash
 python bot.py
 ```
@@ -47,12 +51,15 @@ This repo includes a `Dockerfile` that installs ffmpeg via `apt-get`.
 3. Choose **Dockerfile** build.
 4. Set environment variables:
    - `BOT_TOKEN` = your bot token
+   - `WEBHOOK_URL` = your public base URL (example: `https://<your-app>.koyeb.app`)
+   - `WEBHOOK_PATH` = `/webhook` (optional)
+   - `WEBHOOK_SECRET` = any random string (optional but recommended)
    - (Optional) `WORK_DIR`, `DOWNLOAD_CONCURRENCY`, `MERGE_CONCURRENCY`, `KEEP_FILES`
 5. Deploy.
 
 Notes:
-- This is a long-running worker (polling). You don't need an HTTP port.
-- If Koyeb asks for a port anyway, set an arbitrary `PORT` env var; the bot ignores it.
+- This runs as a webservice and listens on `PORT` (default 8000).
+- The bot sets the Telegram webhook automatically on startup to `WEBHOOK_URL + WEBHOOK_PATH`.
 
 ## Usage
 ### Single merge

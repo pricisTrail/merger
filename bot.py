@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import aiofiles
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
 
 from pipeline import (
@@ -41,6 +43,10 @@ DATA_DIR = Path(os.getenv("WORK_DIR", "data")).resolve()
 DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))
 MERGE_CONCURRENCY = int(os.getenv("MERGE_CONCURRENCY", "2"))
 KEEP_FILES = os.getenv("KEEP_FILES", "0") == "1"
+PORT = int(os.getenv("PORT", "8000"))
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 
 class MergeStates(StatesGroup):
@@ -365,14 +371,44 @@ def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN missing")
+    if not WEBHOOK_URL:
+        raise RuntimeError("WEBHOOK_URL missing (public base url, e.g. https://<app>.koyeb.app)")
     try:
         ensure_dependencies()
     except ToolMissingError as exc:
         raise RuntimeError(str(exc)) from exc
 
+    webhook_base = WEBHOOK_URL.rstrip("/")
+    webhook_path = WEBHOOK_PATH if WEBHOOK_PATH.startswith("/") else f"/{WEBHOOK_PATH}"
+    webhook_full = f"{webhook_base}{webhook_path}"
+
     bot = Bot(token=token)
     dp = build_dispatcher()
-    asyncio.run(dp.start_polling(bot))
+
+    async def on_startup(_: Dispatcher) -> None:
+        await bot.set_webhook(webhook_full, secret_token=WEBHOOK_SECRET)
+
+    async def on_shutdown(_: Dispatcher) -> None:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await bot.session.close()
+
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    async def health(_: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_get("/", health)
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=webhook_path)
+    setup_application(app, dp, bot=bot)
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
