@@ -405,11 +405,13 @@ async def upload_with_progress(
     video_path: Path,
     caption: str,
     progress_cb: Optional[ProgressCallback] = None,
+    destination_id: Optional[int | str] = None,
 ) -> None:
     """Uploads file using Pyrogram to bypass the 50MB Bot API limit."""
     api_id = os.getenv("API_ID")
     api_hash = os.getenv("API_HASH")
     bot_token = bot.token
+    target_chat = destination_id or chat_id
 
     if not api_id or not api_hash:
         LOGGER.warning("API_ID or API_HASH missing. Falling back to aiogram (limit 50MB).")
@@ -417,7 +419,7 @@ async def upload_with_progress(
             if progress_cb:
                 await progress_cb("starting upload (aiogram)")
             await bot.send_video(
-                chat_id=chat_id,
+                chat_id=target_chat,
                 video=FSInputFile(str(video_path)),
                 caption=caption,
                 supports_streaming=True,
@@ -458,7 +460,7 @@ async def upload_with_progress(
                     await progress_cb(format_progress("uploading", current, total, None))
 
             await app.send_video(
-                chat_id=chat_id,
+                chat_id=target_chat,
                 video=str(video_path),
                 caption=caption,
                 supports_streaming=True,

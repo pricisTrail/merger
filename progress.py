@@ -13,9 +13,9 @@ EDIT_THROTTLE_SECONDS = 1.0
 MAX_PROGRESS_LINES = 20
 
 def get_premium_status(stage: str, text: str) -> str:
-    """Parses standard status text and returns a beautified HTML card."""
+    """Parses standard status text and returns a beautified text card."""
     if not text or text in ["queued", "done", "starting", "processing", "waiting"]:
-        return f"   » <b>{stage}</b>: <code>{text or 'queued'}</code>"
+        return f"   » {stage}: {text or 'queued'}"
 
     # Try to extract data: 99% 1.1GiB/1.1GiB 2.8MiB/s ETA 13s
     import re
@@ -25,21 +25,19 @@ def get_premium_status(stage: str, text: str) -> str:
     eta = re.search(r"ETA\s*(\w+)", text)
     
     if not pct:
-        return f"   » <b>{stage}</b>: <code>{text}</code>"
+        return f"   » {stage}: {text}"
 
     percentage = float(pct.group(1))
     filled = int(percentage // 10)
     bar = "🟧" * filled + "⬜" * (10 - filled)
     
-    # Using blockquote for the premium feel
     card = [
-        f"<blockquote>✦ {bar} ✦",
-        f"» 🔋 <b>Percentage</b> • <code>{percentage:.1f}%</code>",
+        f"   ✦ {bar} ✦",
+        f"   » 🔋 Percentage • {percentage:.1f}%",
     ]
-    if spd: card.append(f"» 🚀 <b>Speed</b> • <code>{spd.group(1)}</code>")
-    if sz: card.append(f"» 🚦 <b>Size</b> • <code>{sz.group(1)}</code>")
-    if eta: card.append(f"» ⏰ <b>ETA</b> • <code>{eta.group(1)}</code></blockquote>")
-    else: card[-1] += "</blockquote>"
+    if spd: card.append(f"   » 🚀 Speed • {spd.group(1)}")
+    if sz: card.append(f"   » 🚦 Size • {sz.group(1)}")
+    if eta: card.append(f"   » ⏰ ETA • {eta.group(1)}")
     
     return "\n".join(card)
 
@@ -98,9 +96,9 @@ class ProgressTracker:
             self._last_edit = time.monotonic()
 
     def render(self) -> str:
-        lines = [f"📥 <b>{self.title}</b>\n"]
+        lines = [f"📥 {self.title}\n"]
         for job_id, job in self.jobs.items():
-            lines.append(f"📁 <b>{job_id}. {job.name}</b>")
+            lines.append(f"📁 {job_id}. {job.name}")
             
             lines.append(get_premium_status("Video", job.video))
             lines.append(get_premium_status("Audio", job.audio))
@@ -110,5 +108,5 @@ class ProgressTracker:
             
         if len(lines) > MAX_PROGRESS_LINES:
             lines = lines[:MAX_PROGRESS_LINES]
-            lines.append("<i>... (more jobs being tracked)</i>")
+            lines.append("... (more)")
         return "\n".join(lines)

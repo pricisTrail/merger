@@ -36,8 +36,10 @@ from utils import (
     VIDEO_EXTS,
     LinkJob,
     ensure_mp4_name,
+    get_user_settings,
     parse_links_text,
     safe_filename,
+    set_user_settings,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -59,6 +61,7 @@ class MergeStates(StatesGroup):
 
 router = Router()
 ACTIVE_TASKS: Dict[int, List[asyncio.Task]] = defaultdict(list)
+ACTIVE_TRACKERS: Dict[int, List[ProgressTracker]] = defaultdict(list)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 MERGE_SEMAPHORE = asyncio.Semaphore(MERGE_CONCURRENCY)
 
@@ -124,6 +127,7 @@ async def process_single_merge(
 
     tracker = ProgressTracker(bot, chat_id, "Single merge")
     tracker.add_job(1, output_name)
+    ACTIVE_TRACKERS[chat_id].append(tracker)
     await tracker.start()
 
     video_path = job_dir / safe_filename(video_name or f"video_{job_id}.mp4")
@@ -158,6 +162,8 @@ async def process_single_merge(
         await tracker.update(1, merge=f"failed: {exc}", upload="failed")
         LOGGER.exception("Single merge failed", exc_info=exc)
     finally:
+        if tracker in ACTIVE_TRACKERS[chat_id]:
+            ACTIVE_TRACKERS[chat_id].remove(tracker)
         if not KEEP_FILES:
             shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -178,6 +184,7 @@ async def process_single_merge_with_name(
 
     tracker = ProgressTracker(bot, chat_id, "Single Merge")
     tracker.add_job(1, output_name)
+    ACTIVE_TRACKERS[chat_id].append(tracker)
     await tracker.start()
 
     video_path = job_dir / safe_filename(video_name)
@@ -196,6 +203,10 @@ async def process_single_merge_with_name(
     async def upload_cb(text: str) -> None:
         await tracker.update(1, upload=text)
 
+    # Get user destination
+    settings = get_user_settings(DATA_DIR, chat_id)
+    dest = settings.get("target_channel")
+
     try:
         await tracker.update(1, video="starting", audio="starting")
         await asyncio.gather(
@@ -206,11 +217,13 @@ async def process_single_merge_with_name(
         async with MERGE_SEMAPHORE:
             await merge_stream_copy(video_path, audio_path, output_path, merge_cb)
         await tracker.update(1, upload="starting")
-        await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb)
+        await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb, destination_id=dest)
     except Exception as exc:
         await tracker.update(1, merge=f"failed: {exc}", upload="failed")
         LOGGER.exception("Single merge failed", exc_info=exc)
     finally:
+        if tracker in ACTIVE_TRACKERS[chat_id]:
+            ACTIVE_TRACKERS[chat_id].remove(tracker)
         if not KEEP_FILES:
             shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -242,6 +255,10 @@ async def process_link_job(
     async def upload_cb(text: str) -> None:
         await tracker.update(job.index, upload=text)
 
+    # Get user destination
+    settings = get_user_settings(DATA_DIR, chat_id)
+    dest = settings.get("target_channel")
+
     try:
         await tracker.update(job.index, video="starting", audio="starting")
         video_task = asyncio.create_task(
@@ -269,7 +286,7 @@ async def process_link_job(
         async with MERGE_SEMAPHORE:
             await merge_stream_copy(video_path, audio_path, output_path, merge_cb)
         await tracker.update(job.index, upload="starting")
-        await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb)
+        await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb, destination_id=dest)
         await tracker.update(job.index, upload="done")
     except Exception as exc:
         await tracker.update(job.index, merge=f"failed: {exc}", upload="failed")
@@ -285,6 +302,7 @@ async def process_link_jobs(bot: Bot, message: types.Message, jobs: List[LinkJob
         return
     external_downloader = "aria2c" if shutil.which("aria2c") else None
     tracker = ProgressTracker(bot, message.chat.id, f"Batch ({len(jobs)})")
+    ACTIVE_TRACKERS[message.chat.id].append(tracker)
     for job in jobs:
         tracker.add_job(job.index, job.name)
     await tracker.start()
@@ -293,6 +311,8 @@ async def process_link_jobs(bot: Bot, message: types.Message, jobs: List[LinkJob
         for job in jobs
     ]
     await asyncio.gather(*tasks)
+    if tracker in ACTIVE_TRACKERS[message.chat.id]:
+        ACTIVE_TRACKERS[message.chat.id].remove(tracker)
 
 
 @router.message(Command("single"))
@@ -319,7 +339,12 @@ async def cmd_start(message: types.Message) -> None:
         "🚀 <b>Telegram Multi-Merger Bot</b>\n\n"
         "I can merge video and audio without re-encoding!\n\n"
         "🔹 <b>/single</b> — Merge one pair step-by-step.\n"
-        "🔹 <b>/links</b> — Batch merge using links.txt.\n"
+        "🔹 <b>/links</b> — Batch merge using links.txt.\n\n"
+        "⚙️ <b>Settings</b>\n"
+        "🔹 <b>/setchannel</b> <code>ID</code> — Set destination channel.\n"
+        "🔹 <b>/channel</b> — Show current destination.\n"
+        "🔹 <b>/removechannel</b> — Reset to Private Chat.\n\n"
+        "📊 <b>Other</b>\n"
         "🔹 <b>/status</b> — Check active jobs.\n"
         "🔹 <b>/stop</b> — Stop all active jobs."
     )
@@ -327,16 +352,37 @@ async def cmd_start(message: types.Message) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message) -> None:
-    await message.answer(
-        "Flow:\n"
-        "1) Send an audio file.\n"
-        "2) Send a video file.\n"
-        "MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO.\n\n"
-        "I will download, merge (stream copy), and upload the result.\n"
-        "Batch: /links to send links.txt.\n"
-        "Active status: /status\n"
-        "Cancel all my jobs: /stop"
+    text = (
+        "📖 <b>Telegram Merger Bot — Complete Guide</b>\n\n"
+        "I am a powerful media processing bot that can merge Video and Audio files without re-encoding, preserving 100% of the original quality.\n\n"
+        
+        "🛠 <b>Core Functions</b>\n"
+        "<blockquote>"
+        "🔹 <b>/single</b> — Start a step-by-step merge. I'll ask for audio, then video, then a name.\n"
+        "🔹 <b>/links</b> — Show instructions for Batch Mode processing.\n"
+        "</blockquote>\n"
+
+        "⚙️ <b>Channel Destinations</b>\n"
+        "<i>You can send merged files to any channel where I am an Admin.</i>\n"
+        "<blockquote>"
+        "🔹 <b>/setchannel</b> <code>[ID/@User]</code> — Set target channel.\n"
+        "🔹 <b>/channel</b> — Verify current destination.\n"
+        "🔹 <b>/removechannel</b> — Reset to Private Chat."
+        "</blockquote>\n"
+
+        "📊 <b>Management</b>\n"
+        "<blockquote>"
+        "🔹 <b>/status</b> — Detailed real-time view of all active jobs.\n"
+        "🔹 <b>/stop</b> — Kill all background tasks and clean up.\n"
+        "🔹 <b>/cancel</b> — Reset the current /single flow."
+        "</blockquote>\n\n"
+
+        "💡 <b>Pro Tips:</b>\n"
+        "• Paste the <code>links.txt</code> content directly in chat for instant batching.\n"
+        "• Files up to <b>2GB</b> are supported via Pyrogram.\n"
+        "• Use <code>/status</code> if you lose a progress message."
     )
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("links"))
@@ -360,6 +406,7 @@ async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
 async def cmd_status(message: types.Message) -> None:
     chat_id = message.chat.id
     tasks = ACTIVE_TASKS.get(chat_id, [])
+    trackers = ACTIVE_TRACKERS.get(chat_id, [])
     
     if not tasks:
         await message.answer("✅ <b>No active jobs</b> for this chat.")
@@ -372,16 +419,20 @@ async def cmd_status(message: types.Message) -> None:
         usage = "🖥 System tracking not available"
 
     text = (
-        f"📊 <b>Job Status for {message.from_user.first_name}</b>\n\n"
-        f"🏃 <b>Active Tasks</b>: {len(tasks)}\n"
+        f"📊 <b>Detailed Status for {message.from_user.first_name}</b>\n"
+        f"🏃 <b>Active Processes</b>: {len(tasks)}\n"
         f"{usage}\n\n"
-        "<i>Use the progress message sent earlier for detailed live updates.</i>"
     )
+    
+    for tracker in trackers:
+        text += tracker.render() + "\n"
+
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("stop"))
 async def cmd_stop(message: types.Message) -> None:
+    # ... (existing stop logic) ...
     chat_id = message.chat.id
     tasks = ACTIVE_TASKS.get(chat_id, [])
     if not tasks:
@@ -392,8 +443,61 @@ async def cmd_stop(message: types.Message) -> None:
     for task in tasks:
         task.cancel()
     
-    # Logic in track_task will handle removing them from the list
     await message.answer(f"Cancelled {count} active job(s). Cleanup might take a few seconds.")
+
+
+@router.message(Command("setchannel"))
+async def cmd_setchannel(message: types.Message) -> None:
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ <b>Usage</b>: <code>/setchannel -100123456789</code> or <code>/setchannel @MyChannel</code>")
+        return
+    
+    target = args[1].strip()
+    # If it's a number, convert to int
+    if target.startswith("-") and target[1:].isdigit():
+        target = int(target)
+    
+    try:
+        # Verify bot is admin or at least the channel exists
+        test = await message.bot.get_chat(target)
+        target_id = test.id
+        title = test.title or test.full_name
+        
+        settings = get_user_settings(DATA_DIR, message.chat.id)
+        settings["target_channel"] = target_id
+        set_user_settings(DATA_DIR, message.chat.id, settings)
+        
+        await message.answer(f"✅ <b>Success!</b> Merged files will now be uploaded to: <b>{title}</b> (<code>{target_id}</code>)")
+    except Exception as e:
+        await message.answer(f"❌ <b>Error</b>: Could not set channel. Make sure the bot is an Admin there.\n\n<code>{str(e)}</code>")
+
+
+@router.message(Command("channel"))
+async def cmd_channel(message: types.Message) -> None:
+    settings = get_user_settings(DATA_DIR, message.chat.id)
+    dest = settings.get("target_channel")
+    
+    if not dest:
+        await message.answer("📍 <b>Current Destination</b>: Your Private Chat (PM).")
+        return
+    
+    try:
+        chat = await message.bot.get_chat(dest)
+        await message.answer(f"📍 <b>Current Destination</b>: <b>{chat.title or chat.full_name}</b> (<code>{dest}</code>)")
+    except Exception:
+        await message.answer(f"📍 <b>Current Destination</b>: <code>{dest}</code> (Cannot fetch info, check admin rights).")
+
+
+@router.message(Command("removechannel"))
+async def cmd_removechannel(message: types.Message) -> None:
+    settings = get_user_settings(DATA_DIR, message.chat.id)
+    if "target_channel" in settings:
+        del settings["target_channel"]
+        set_user_settings(DATA_DIR, message.chat.id, settings)
+        await message.answer("✅ <b>Destination Reset!</b> Files will now be uploaded to your Private Chat.")
+    else:
+        await message.answer("💡 You don't have a channel set.")
 
 
 @router.message(F.audio)

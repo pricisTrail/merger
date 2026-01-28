@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,3 +125,25 @@ def parse_links_text(text: str) -> List[LinkJob]:
         name = ensure_mp4_name(entry.get("name", f"merge_{i}"))
         jobs.append(LinkJob(index=i, audio=audio, video=video, name=name))
     return jobs
+
+
+def get_user_settings(data_dir: Path, chat_id: int) -> dict:
+    settings_path = data_dir / str(chat_id) / "settings.json"
+    if not settings_path.exists():
+        return {}
+    try:
+        with open(settings_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def set_user_settings(data_dir: Path, chat_id: int, settings: dict) -> None:
+    user_dir = data_dir / str(chat_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = user_dir / "settings.json"
+    try:
+        with open(settings_path, "w") as f:
+            json.dump(settings, f)
+    except Exception:
+        pass
