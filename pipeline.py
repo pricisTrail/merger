@@ -10,9 +10,11 @@ from typing import Awaitable, Callable, Optional
 
 import aiofiles
 import aiohttp
+import os
 from aiogram import Bot
 from aiogram.types import FSInputFile
 from yt_dlp import YoutubeDL
+from pyrogram import Client
 
 from utils import format_bytes, format_duration, format_speed
 
@@ -337,19 +339,57 @@ async def upload_with_progress(
     caption: str,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
-    # Basic upload without progress first to ensure stability
-    # Aiogram 3.x doesn't support progress callbacks for FSInputFile easily.
-    # We will use the built-in way which is stable.
+    """Uploads file using Pyrogram to bypass the 50MB Bot API limit."""
+    api_id = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    bot_token = bot.token
+
+    if not api_id or not api_hash:
+        LOGGER.warning("API_ID or API_HASH missing. Falling back to aiogram (limit 50MB).")
+        try:
+            if progress_cb:
+                await progress_cb("starting upload (aiogram)")
+            await bot.send_video(
+                chat_id=chat_id,
+                video=FSInputFile(str(video_path)),
+                caption=caption,
+                supports_streaming=True,
+            )
+            if progress_cb:
+                await progress_cb("done")
+            return
+        except Exception as e:
+            if progress_cb:
+                await progress_cb(f"failed: {str(e)}")
+            raise e
+
+    # Use Pyrogram for large files
     try:
         if progress_cb:
-            await progress_cb("starting")
+            await progress_cb("initializing uploader")
         
-        await bot.send_video(
-            chat_id=chat_id,
-            video=FSInputFile(str(video_path)),
-            caption=caption,
-            supports_streaming=True,
-        )
+        async with Client(
+            name=f"uploader_{chat_id}",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            bot_token=bot_token,
+            in_memory=True,
+        ) as app:
+            if progress_cb:
+                await progress_cb("uploading")
+
+            async def pyrogram_progress(current, total):
+                if progress_cb:
+                    await progress_cb(format_progress("uploading", current, total, None))
+
+            await app.send_video(
+                chat_id=chat_id,
+                video=str(video_path),
+                caption=caption,
+                supports_streaming=True,
+                progress=pyrogram_progress
+            )
+            
         if progress_cb:
             await progress_cb("done")
     except Exception as e:
