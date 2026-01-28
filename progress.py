@@ -10,25 +10,37 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
 EDIT_THROTTLE_SECONDS = 1.0
-MAX_PROGRESS_LINES = 14
+MAX_PROGRESS_LINES = 20
 
-def get_progress_bar(text: str) -> str:
-    """Extracts percentage from text and returns a visual bar or empty string."""
-    if not text or "%" not in text:
-        return ""
-    try:
-        # Match percentage like 45.2% or 45%
-        import re
-        match = re.search(r"(\d+\.?\d*)%", text)
-        if not match:
-            return ""
-        percentage = float(match.group(1))
-        # Create a 10-char bar
-        filled = int(percentage // 10)
-        bar = "▰" * filled + "▱" * (10 - filled)
-        return f"\n      └ {bar} {percentage:.1f}%"
-    except Exception:
-        return ""
+def get_premium_status(stage: str, text: str) -> str:
+    """Parses standard status text and returns a beautified card."""
+    if not text or text in ["queued", "done", "starting", "processing", "waiting"]:
+        return f"   » **{stage}**: `{text or 'queued'}`"
+
+    # Try to extract data: 99% 1.1GiB/1.1GiB 2.8MiB/s ETA 13s
+    import re
+    pct = re.search(r"(\d+\.?\d*)%", text)
+    sz = re.search(r"(\d+\.?\d*[KMGT]i?B/\d+\.?\d*[KMGT]i?B)", text)
+    spd = re.search(r"(\d+\.?\d*[KMGT]i?B/s)", text)
+    eta = re.search(r"ETA\s*(\w+)", text)
+    
+    if not pct:
+        return f"   » **{stage}**: `{text}`"
+
+    percentage = float(pct.group(1))
+    # ✦ 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ✦
+    filled = int(percentage // 10)
+    bar = "🟧" * filled + "⬜" * (10 - filled)
+    
+    card = [
+        f"   > ✦ {bar} ✦",
+        f"   > » 🔋 **Percentage** • `{percentage:.1f}%`",
+    ]
+    if spd: card.append(f"   > » 🚀 **Speed** • `{spd.group(1)}`")
+    if sz: card.append(f"   > » 🚦 **Size** • `{sz.group(1)}`")
+    if eta: card.append(f"   > » ⏰ **ETA** • `{eta.group(1)}`")
+    
+    return "\n".join(card)
 
 
 @dataclass
@@ -85,28 +97,18 @@ class ProgressTracker:
             self._last_edit = time.monotonic()
 
     def render(self) -> str:
-        lines = [f"✨ **{self.title}**"]
+        lines = [f"📥 **{self.title}**\n"]
         for job_id, job in self.jobs.items():
-            lines.append(f"📦 **{job_id}. {job.name}**")
+            lines.append(f"📁 **{job_id}. {job.name}**")
             
-            # Create sub-status lines
-            v_bar = get_progress_bar(job.video)
-            a_bar = get_progress_bar(job.audio)
-            m_bar = get_progress_bar(job.merge)
-            u_bar = get_progress_bar(job.upload)
-            
-            lines.append(f"   🔹 V: `{job.video or 'queued'}`")
-            if v_bar: lines.append(v_bar)
-            lines.append(f"   🔹 A: `{job.audio or 'queued'}`")
-            if a_bar: lines.append(a_bar)
-            lines.append(f"   🔹 M: `{job.merge or 'queued'}`")
-            if m_bar: lines.append(m_bar)
-            lines.append(f"   🔹 U: `{job.upload or 'queued'}`")
-            if u_bar: lines.append(u_bar)
+            # Use premium styling for each stage
+            lines.append(get_premium_status("Video", job.video))
+            lines.append(get_premium_status("Audio", job.audio))
+            lines.append(get_premium_status("Merge", job.merge))
+            lines.append(get_premium_status("Upload", job.upload))
             lines.append("") # Spacer
             
         if len(lines) > MAX_PROGRESS_LINES:
-            # Note: with bars, we might hit the limit faster
             lines = lines[:MAX_PROGRESS_LINES]
-            lines.append("... (more jobs below)")
+            lines.append("... (more jobs being tracked)")
         return "\n".join(lines)

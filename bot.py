@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 import aiofiles
 from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -50,8 +52,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 
 class MergeStates(StatesGroup):
-    waiting_video = State()
     waiting_audio = State()
+    waiting_video = State()
+    waiting_name = State()
 
 
 router = Router()
@@ -159,6 +162,59 @@ async def process_single_merge(
             shutil.rmtree(job_dir, ignore_errors=True)
 
 
+async def process_single_merge_with_name(
+    bot: Bot,
+    chat_id: int,
+    video_id: str,
+    audio_id: str,
+    video_name: str,
+    audio_name: str,
+    output_name: str,
+) -> None:
+    job_id = int(time.time())
+    output_name = ensure_mp4_name(output_name)
+    job_dir = DATA_DIR / str(chat_id) / f"job_{job_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    tracker = ProgressTracker(bot, chat_id, "Single Merge")
+    tracker.add_job(1, output_name)
+    await tracker.start()
+
+    video_path = job_dir / safe_filename(video_name)
+    audio_path = job_dir / safe_filename(audio_name)
+    output_path = job_dir / safe_filename(output_name)
+
+    async def video_cb(text: str) -> None:
+        await tracker.update(1, video=text)
+
+    async def audio_cb(text: str) -> None:
+        await tracker.update(1, audio=text)
+
+    async def merge_cb(text: str) -> None:
+        await tracker.update(1, merge=text)
+
+    async def upload_cb(text: str) -> None:
+        await tracker.update(1, upload=text)
+
+    try:
+        await tracker.update(1, video="starting", audio="starting")
+        await asyncio.gather(
+            download_telegram_file(bot, video_id, video_path, DOWNLOAD_SEMAPHORE, video_cb),
+            download_telegram_file(bot, audio_id, audio_path, DOWNLOAD_SEMAPHORE, audio_cb),
+        )
+        await tracker.update(1, merge="waiting")
+        async with MERGE_SEMAPHORE:
+            await merge_stream_copy(video_path, audio_path, output_path, merge_cb)
+        await tracker.update(1, upload="starting")
+        await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb)
+    except Exception as exc:
+        await tracker.update(1, merge=f"failed: {exc}", upload="failed")
+        LOGGER.exception("Single merge failed", exc_info=exc)
+    finally:
+        if not KEEP_FILES:
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
 async def process_link_job(
     bot: Bot,
     chat_id: int,
@@ -239,33 +295,33 @@ async def process_link_jobs(bot: Bot, message: types.Message, jobs: List[LinkJob
     await asyncio.gather(*tasks)
 
 
+@router.message(Command("single"))
+async def cmd_single(message: types.Message, state: FSMContext) -> None:
+    await state.set_state(MergeStates.waiting_audio)
+    await message.answer("🎵 **Step 1/3**: Please send the **Audio** file.")
+
+
 async def start_audio_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
     await state.update_data(audio_id=file_id, audio_name=name)
     await state.set_state(MergeStates.waiting_video)
-    await message.answer("Audio received. Now send the video file.")
+    await message.answer("📹 **Step 2/3**: Audio received. Now send the **Video** file.")
 
 
 async def start_video_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
-    data = await state.get_data()
-    audio_id = data.get("audio_id")
-    audio_name = data.get("audio_name")
-    if not audio_id:
-        await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
-        return
-    await state.clear()
-    await message.answer("Processing merge. Progress will appear below.")
-    task = asyncio.create_task(
-        process_single_merge(message.bot, message.chat.id, file_id, audio_id, name, audio_name)
-    )
-    track_task(message.chat.id, task)
+    await state.update_data(video_id=file_id, video_name=name)
+    await state.set_state(MergeStates.waiting_name)
+    await message.answer("✏️ **Step 3/3**: Video received. Now send the **Output Name** for your file (e.g. MyVideo).")
 
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message) -> None:
     await message.answer(
-        "Send an audio file, then a video file to merge without re-encoding.\n"
-        "MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO.\n"
-        "For batch mode, send /links and upload links.txt with audio/video/name entries."
+        "🚀 **Telegram Multi-Merger Bot**\n\n"
+        "I can merge video and audio without re-encoding!\n\n"
+        "🔹 **/single** - Merge one pair step-by-step.\n"
+        "🔹 **/links** - Batch merge using links.txt.\n"
+        "🔹 **/status** - Check active jobs.\n"
+        "🔹 **/stop** - Stop all active jobs."
     )
 
 
@@ -286,16 +342,18 @@ async def cmd_help(message: types.Message) -> None:
 @router.message(Command("links"))
 async def cmd_links(message: types.Message) -> None:
     await message.answer(
-        "Send links.txt or paste the text in this format:\n\n"
-        "audio - <link>\nvideo - <link>\nname - <name>.mp4\n\n"
-        "audio1 - <link>\nvideo1 - <link>\nname1 - <name>.mp4"
+        "📂 **Batch Mode Configuration**\n\n"
+        "Send a `.txt` file or paste text in this format:\n\n"
+        "`audio - <link>`\n"
+        "`video - <link>`\n"
+        "`name  - <name>.mp4`"
     )
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Waiting state cleared (if you were sending audio/video separately). Active background jobs keep running. Use /status to see jobs or /stop to kill all.")
+    await message.answer("🧹 **State Cleared.** All waiting inputs have been reset. Type /status to see running jobs.")
 
 
 @router.message(Command("status"))
@@ -339,22 +397,25 @@ async def cmd_stop(message: types.Message) -> None:
     await message.answer(f"Cancelled {count} active job(s). Cleanup might take a few seconds.")
 
 
+@router.message(F.audio)
+async def handle_audio(message: types.Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state != MergeStates.waiting_audio:
+        return # Ignore unsolicited audio if not in flow
+    audio = message.audio
+    name = audio.file_name or f"audio_{message.message_id}.mp3"
+    await start_audio_flow(message, state, audio.file_id, name)
+
+
 @router.message(F.video)
 async def handle_video(message: types.Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     if current_state != MergeStates.waiting_video:
-        await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
+        await message.answer("⚠️ Please send /single to start the merge flow correctly.")
         return
     video = message.video
     name = video.file_name or f"video_{message.message_id}.mp4"
     await start_video_flow(message, state, video.file_id, name)
-
-
-@router.message(F.audio)
-async def handle_audio(message: types.Message, state: FSMContext) -> None:
-    audio = message.audio
-    name = audio.file_name or f"audio_{message.message_id}.mp3"
-    await start_audio_flow(message, state, audio.file_id, name)
 
 
 @router.message(F.document)
@@ -384,17 +445,39 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
 @router.message(F.text)
 async def handle_text(message: types.Message, state: FSMContext) -> None:
     current_state = await state.get_state()
-    if current_state == MergeStates.waiting_video:
-        await message.answer("Waiting for video file. Send video to continue.")
+    
+    # Handle the "Name" step of /single flow
+    if current_state == MergeStates.waiting_name:
+        data = await state.get_data()
+        await state.clear()
+        
+        output_name = message.text.strip()
+        await message.answer(f"✅ Starting merge for **{output_name}**. Progress shown below.")
+        
+        task = asyncio.create_task(
+            process_single_merge_with_name(
+                message.bot, 
+                message.chat.id, 
+                data["video_id"], 
+                data["audio_id"], 
+                data["video_name"], 
+                data["audio_name"],
+                output_name
+            )
+        )
+        track_task(message.chat.id, task)
         return
+
+    # Handle Batch paste
     text = message.text or ""
     jobs = parse_links_text(text)
     if jobs:
-        await message.answer("Starting batch merge. Progress will appear below.")
+        await message.answer("🚀 Starting batch merge. Progress shown below.")
         task = asyncio.create_task(process_link_jobs(message.bot, message, jobs))
         track_task(message.chat.id, task)
         return
-    await message.answer("Send an audio file or /links for batch mode.")
+    
+    await message.answer("❓ Send /single to start a merge or /links for batch mode.")
 
 
 async def handle_links_file(message: types.Message, document: types.Document) -> None:
@@ -433,7 +516,10 @@ def main() -> None:
     webhook_path = webhook_path_env if webhook_path_env.startswith("/") else f"/{webhook_path_env}"
     webhook_full = f"{webhook_base}{webhook_path}"
 
-    bot = Bot(token=token)
+    bot = Bot(
+        token=token,
+        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+    )
     dp = build_dispatcher()
 
     async def _set_webhook_background() -> None:
