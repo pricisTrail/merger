@@ -399,10 +399,10 @@ def main() -> None:
         except Exception as exc:
             LOGGER.exception("Failed to set webhook to %s", webhook_full, exc_info=exc)
 
-    async def on_startup(_: Dispatcher) -> None:
+    async def on_startup(*_args, **_kwargs) -> None:
         asyncio.create_task(_set_webhook_background())
 
-    async def on_shutdown(_: Dispatcher) -> None:
+    async def on_shutdown(*_args, **_kwargs) -> None:
         await bot.delete_webhook(drop_pending_updates=False)
         await bot.session.close()
 
