@@ -86,14 +86,64 @@ async def download_telegram_file(
     semaphore: asyncio.Semaphore,
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
+    """Download file from Telegram using Pyrogram (supports up to 2GB).
+    Falls back to Bot API for small files if Pyrogram credentials missing.
+    """
+    api_id = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    bot_token = bot.token
+    
     async with semaphore:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Use Pyrogram for large file support (up to 2GB)
+        if api_id and api_hash:
+            try:
+                if progress_cb:
+                    await progress_cb("connecting...")
+                
+                async with Client(
+                    name=f"downloader_{dest_path.stem}",
+                    api_id=int(api_id),
+                    api_hash=api_hash,
+                    bot_token=bot_token,
+                    in_memory=True,
+                ) as app:
+                    if progress_cb:
+                        await progress_cb("downloading...")
+                    
+                    last_emit = 0.0
+                    
+                    async def pyrogram_progress(current: int, total: int) -> None:
+                        nonlocal last_emit
+                        now = asyncio.get_event_loop().time()
+                        if now - last_emit > 0.8 and progress_cb:
+                            speed = None  # Pyrogram doesn't provide speed
+                            text = format_progress("downloading", current, total, speed)
+                            await progress_cb(text)
+                            last_emit = now
+                    
+                    await app.download_media(
+                        file_id,
+                        file_name=str(dest_path),
+                        progress=pyrogram_progress,
+                    )
+                
+                if progress_cb:
+                    await progress_cb("done")
+                return
+                
+            except Exception as exc:
+                LOGGER.warning("Pyrogram download failed, trying Bot API: %s", exc)
+        
+        # Fallback: Bot API (only works for files < 20MB)
+        LOGGER.info("Using Bot API for download (limit 20MB)")
         file = await bot.get_file(file_id)
         if not file.file_path:
             raise RuntimeError("Telegram file path missing")
         url = f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
         total = file.file_size
         progress = ByteProgress("downloading", total, progress_cb)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 resp.raise_for_status()
