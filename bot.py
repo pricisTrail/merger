@@ -556,22 +556,44 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
     if not document:
         return
     current_state = await state.get_state()
-    if is_video_document(document):
-        if current_state == MergeStates.waiting_video:
-            await start_video_flow(message, state, document.file_id, document.file_name or "video.mp4")
-            return
-        await message.answer("Please send an audio file first. MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
-        return
-    if is_audio_document(document):
-        await start_audio_flow(message, state, document.file_id, document.file_name or "audio")
-        return
+    
+    # Handle .txt files first (links batch)
     if document.file_name and document.file_name.lower().endswith(".txt"):
         await handle_links_file(message, document)
         return
     if document.mime_type == "text/plain":
         await handle_links_file(message, document)
         return
-    await message.answer("Unsupported document type. Send video/audio or links.txt. , MAKE SURE THE FIRST DOCUMENT WILL BE AUDIO THEN VIDEO")
+    
+    # Check if audio (explicitly audio MIME or audio extension)
+    if is_audio_document(document):
+        if current_state == MergeStates.waiting_audio:
+            await start_audio_flow(message, state, document.file_id, document.file_name or "audio")
+            return
+        elif current_state is None:
+            # User not in flow, start it
+            await state.set_state(MergeStates.waiting_audio)
+            await start_audio_flow(message, state, document.file_id, document.file_name or "audio")
+            return
+        # In wrong state
+        await message.answer("⚠️ Audio received but I'm waiting for video. Send a VIDEO file now.")
+        return
+    
+    # Check if video
+    if is_video_document(document):
+        # SPECIAL CASE: In waiting_audio state, allow .mp4 files as audio
+        # (Many audio files are packaged in MP4 containers like M4A)
+        if current_state == MergeStates.waiting_audio:
+            await start_audio_flow(message, state, document.file_id, document.file_name or "audio.mp4")
+            return
+        elif current_state == MergeStates.waiting_video:
+            await start_video_flow(message, state, document.file_id, document.file_name or "video.mp4")
+            return
+        # User not in flow
+        await message.answer("⚠️ You sent a video. Use /single to start the merge flow, then send **Audio first**, then Video.")
+        return
+    
+    await message.answer("❓ Unsupported file type. Send audio/video files or a links.txt file.")
 
 
 @router.message(F.text)
