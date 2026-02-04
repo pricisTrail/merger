@@ -79,6 +79,36 @@ class ByteProgress:
             await self.callback("done")
 
 
+# Shared Pyrogram client for concurrent downloads
+_pyrogram_client: Optional[Client] = None
+_pyrogram_lock = asyncio.Lock()
+
+
+async def get_pyrogram_client(bot_token: str) -> Optional[Client]:
+    """Get or create a shared Pyrogram client."""
+    global _pyrogram_client
+    
+    api_id = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    
+    if not api_id or not api_hash:
+        return None
+    
+    async with _pyrogram_lock:
+        if _pyrogram_client is None or not _pyrogram_client.is_connected:
+            _pyrogram_client = Client(
+                name="shared_downloader",
+                api_id=int(api_id),
+                api_hash=api_hash,
+                bot_token=bot_token,
+                in_memory=True,
+            )
+            await _pyrogram_client.start()
+            LOGGER.info("Shared Pyrogram client started")
+    
+    return _pyrogram_client
+
+
 async def download_telegram_file(
     bot: Bot,
     file_id: str,
@@ -89,45 +119,32 @@ async def download_telegram_file(
     """Download file from Telegram using Pyrogram (supports up to 2GB).
     Falls back to Bot API for small files if Pyrogram credentials missing.
     """
-    api_id = os.getenv("API_ID")
-    api_hash = os.getenv("API_HASH")
-    bot_token = bot.token
-    
     async with semaphore:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Use Pyrogram for large file support (up to 2GB)
-        if api_id and api_hash:
+        # Use shared Pyrogram client for large file support (up to 2GB)
+        app = await get_pyrogram_client(bot.token)
+        if app:
             try:
                 if progress_cb:
-                    await progress_cb("connecting...")
+                    await progress_cb("downloading...")
                 
-                async with Client(
-                    name=f"downloader_{dest_path.stem}",
-                    api_id=int(api_id),
-                    api_hash=api_hash,
-                    bot_token=bot_token,
-                    in_memory=True,
-                ) as app:
-                    if progress_cb:
-                        await progress_cb("downloading...")
-                    
-                    last_emit = 0.0
-                    
-                    async def pyrogram_progress(current: int, total: int) -> None:
-                        nonlocal last_emit
-                        now = asyncio.get_event_loop().time()
-                        if now - last_emit > 0.8 and progress_cb:
-                            speed = None  # Pyrogram doesn't provide speed
-                            text = format_progress("downloading", current, total, speed)
-                            await progress_cb(text)
-                            last_emit = now
-                    
-                    await app.download_media(
-                        file_id,
-                        file_name=str(dest_path),
-                        progress=pyrogram_progress,
-                    )
+                last_emit = 0.0
+                
+                async def pyrogram_progress(current: int, total: int) -> None:
+                    nonlocal last_emit
+                    now = asyncio.get_event_loop().time()
+                    if now - last_emit > 0.8 and progress_cb:
+                        speed = None  # Pyrogram doesn't provide speed
+                        text = format_progress("downloading", current, total, speed)
+                        await progress_cb(text)
+                        last_emit = now
+                
+                await app.download_media(
+                    file_id,
+                    file_name=str(dest_path),
+                    progress=pyrogram_progress,
+                )
                 
                 if progress_cb:
                     await progress_cb("done")
