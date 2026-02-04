@@ -170,6 +170,70 @@ def _run_ytdlp(
     return Path(filename)
 
 
+async def _run_wget(
+    url: str,
+    dest_path: Path,
+    progress_cb: Optional[ProgressCallback],
+) -> Path:
+    """Download using wget with retry, resume, and timeout support."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    cmd = [
+        "wget",
+        url,
+        "-O", str(dest_path),
+        # Retry & Resume
+        "--tries=5",                    # Retry up to 5 times
+        "--continue",                   # Resume partial downloads
+        "--waitretry=3",                # Wait 3 seconds between retries
+        # Timeout handling
+        "--timeout=60",                 # Network timeout 60s
+        "--dns-timeout=30",             # DNS lookup timeout
+        "--connect-timeout=30",         # Connection timeout
+        "--read-timeout=120",           # Read timeout 2 minutes
+        # Optimizations
+        "--no-check-certificate",       # Skip SSL verification for speed
+        "--progress=bar:force:noscroll", # Show progress
+        "-q", "--show-progress",        # Quiet but show progress bar
+    ]
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    
+    last_emit = 0.0
+    if process.stderr:  # wget outputs progress to stderr
+        async for raw in process.stderr:
+            try:
+                line = raw.decode("utf-8", "ignore").strip()
+                # wget progress: 50% [=====>     ] 50M  10.5M/s eta 5s
+                if "%" in line:
+                    now = asyncio.get_event_loop().time()
+                    if now - last_emit > 0.8 and progress_cb:
+                        # Clean up the progress line
+                        await progress_cb(f"wget: {line[:60]}")
+                        last_emit = now
+            except Exception:
+                continue
+
+    stdout, stderr = await process.communicate()
+    
+    if process.returncode != 0:
+        error = stderr.decode("utf-8", "ignore").strip() if stderr else "wget failed"
+        raise RuntimeError(error)
+    
+    # Verify file exists and has content
+    if not dest_path.exists() or dest_path.stat().st_size == 0:
+        raise RuntimeError("wget completed but file is empty or missing")
+    
+    if progress_cb:
+        await progress_cb("done")
+    
+    return dest_path
+
+
 async def _run_aria2c(
     url: str,
     dest_path: Path,
@@ -281,14 +345,29 @@ async def download_url(
         
         for attempt in range(1, max_retries + 1):
             try:
-                # Try aria2c first if it's available
+                # ENGINE 1: Try wget first (simple, reliable, good resume support)
+                if shutil.which("wget"):
+                    try:
+                        LOGGER.info("Trying wget for %s (attempt %d/%d)", url, attempt, max_retries)
+                        if progress_cb:
+                            await progress_cb(f"downloading (wget, attempt {attempt})")
+                        result = await _run_wget(url, dest_path, progress_cb)
+                        if result.exists() and result.stat().st_size > 0:
+                            return result
+                        else:
+                            raise RuntimeError("wget completed but file is empty or missing")
+                    except Exception as exc:
+                        LOGGER.warning("wget failed (attempt %d): %s", attempt, exc)
+                        if progress_cb:
+                            await progress_cb(f"wget failed, trying aria2c...")
+                
+                # ENGINE 2: Try aria2c (multi-connection, faster for large files)
                 if shutil.which("aria2c"):
                     try:
                         LOGGER.info("Trying aria2c for %s (attempt %d/%d)", url, attempt, max_retries)
                         if progress_cb:
                             await progress_cb(f"downloading (aria2c, attempt {attempt})")
                         result = await _run_aria2c(url, dest_path, progress_cb)
-                        # Verify file exists and has content
                         if result.exists() and result.stat().st_size > 0:
                             return result
                         else:
@@ -298,7 +377,7 @@ async def download_url(
                         if progress_cb:
                             await progress_cb(f"aria2c failed, trying yt-dlp...")
                 
-                # Fallback to yt-dlp with timeout
+                # ENGINE 3: Fallback to yt-dlp (handles complex sites, authentication, etc.)
                 LOGGER.info("Trying yt-dlp for %s (attempt %d/%d)", url, attempt, max_retries)
                 if progress_cb:
                     await progress_cb(f"downloading (yt-dlp, attempt {attempt})")
