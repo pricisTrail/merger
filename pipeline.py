@@ -169,9 +169,6 @@ async def _run_aria2c(
     progress_cb: Optional[ProgressCallback],
 ) -> Path:
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    # Use a temporary name to avoid conflicts, then rename based on what aria2c actually downloads
-    # Or better, just specify the output file name if we can.
-    # But often we don't know the extension.
     
     cmd = [
         "aria2c",
@@ -179,10 +176,27 @@ async def _run_aria2c(
         "--dir", str(dest_path.parent),
         "--out", dest_path.name,
         "--allow-overwrite=true",
+        # Multi-connection settings
         "--max-connection-per-server=16",
         "--split=16",
-        "--min-split-size=1M",
+        "--min-split-size=5M",              # Optimized chunk size (5MB per chunk)
+        "--piece-length=5M",                # Piece length for better parallel downloads
+        # Retry & Resume support
+        "--continue=true",                  # Resume partial/interrupted downloads
+        "--max-tries=5",                    # Retry up to 5 times on failure
+        "--retry-wait=3",                   # Wait 3 seconds between retries
+        "--max-file-not-found=3",           # Retry if server returns file not found
+        # Connection timeout handling
+        "--timeout=60",                     # Overall connection timeout (60s)
+        "--connect-timeout=30",             # Initial connection timeout (30s)
+        "--lowest-speed-limit=10K",         # Drop connections slower than 10KB/s
+        "--max-resume-failure-tries=5",     # Resume retry attempts
+        # Optimizations
+        "--stream-piece-selector=geom",     # Geometric piece selection for streaming
+        "--uri-selector=adaptive",          # Adaptive URI selection
+        "--auto-file-renaming=false",       # Don't rename on conflict
         "--summary-interval=1",
+        "--console-log-level=warn",         # Reduce log noise
     ]
     
     process = await asyncio.create_subprocess_exec(
