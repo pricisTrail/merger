@@ -259,35 +259,64 @@ async def process_link_job(
     settings = get_user_settings(DATA_DIR, chat_id)
     dest = settings.get("target_channel")
 
+    video_path = None
+    audio_path = None
+
     try:
+        # Phase 1: Download video and audio
         await tracker.update(job.index, video="starting", audio="starting")
-        video_task = asyncio.create_task(
-            download_url(
-                job.video,
-                video_dest,
-                "video",
-                DOWNLOAD_SEMAPHORE,
-                video_cb,
-                external_downloader,
+        
+        try:
+            video_task = asyncio.create_task(
+                download_url(
+                    job.video,
+                    video_dest,
+                    "video",
+                    DOWNLOAD_SEMAPHORE,
+                    video_cb,
+                    external_downloader,
+                )
             )
-        )
-        audio_task = asyncio.create_task(
-            download_url(
-                job.audio,
-                audio_dest,
-                "audio",
-                DOWNLOAD_SEMAPHORE,
-                audio_cb,
-                external_downloader,
+            audio_task = asyncio.create_task(
+                download_url(
+                    job.audio,
+                    audio_dest,
+                    "audio",
+                    DOWNLOAD_SEMAPHORE,
+                    audio_cb,
+                    external_downloader,
+                )
             )
-        )
-        video_path, audio_path = await asyncio.gather(video_task, audio_task)
+            video_path, audio_path = await asyncio.gather(video_task, audio_task)
+        except Exception as exc:
+            # Determine which download failed
+            error_msg = str(exc)
+            if "video" in error_msg.lower() or (video_path is None):
+                await tracker.update(job.index, video=f"failed: {exc}", merge="skipped", upload="skipped")
+            else:
+                await tracker.update(job.index, audio=f"failed: {exc}", merge="skipped", upload="skipped")
+            LOGGER.exception("Download failed for job %s", job.index, exc_info=exc)
+            return
+        
+        # Phase 2: Merge
         await tracker.update(job.index, merge="waiting")
-        async with MERGE_SEMAPHORE:
-            await merge_stream_copy(video_path, audio_path, output_path, merge_cb)
+        try:
+            async with MERGE_SEMAPHORE:
+                await merge_stream_copy(video_path, audio_path, output_path, merge_cb)
+        except Exception as exc:
+            await tracker.update(job.index, merge=f"failed: {exc}", upload="skipped")
+            LOGGER.exception("Merge failed for job %s", job.index, exc_info=exc)
+            return
+        
+        # Phase 3: Upload
         await tracker.update(job.index, upload="starting")
-        await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb, destination_id=dest)
-        await tracker.update(job.index, upload="done")
+        try:
+            await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb, destination_id=dest)
+            await tracker.update(job.index, upload="done")
+        except Exception as exc:
+            await tracker.update(job.index, upload=f"failed: {exc}")
+            LOGGER.exception("Upload failed for job %s", job.index, exc_info=exc)
+            
     except Exception as exc:
         await tracker.update(job.index, merge=f"failed: {exc}", upload="failed")
         LOGGER.exception("Batch job %s failed", job.index, exc_info=exc)

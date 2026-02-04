@@ -138,6 +138,13 @@ def _run_ytdlp(
         "noplaylist": True,
         "progress_hooks": [hook],
         "overwrites": True,
+        # Timeout and retry settings
+        "socket_timeout": 120,          # 2 minute socket timeout
+        "retries": 3,                   # Retry download 3 times
+        "fragment_retries": 5,          # Retry fragments 5 times
+        "retry_sleep_functions": {"http": lambda n: 5 * (n + 1)},  # Exponential backoff
+        "file_access_retries": 3,       # Retry file access
+        "extractor_retries": 3,         # Retry extractor
     }
     if media_format == "audio":
         ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
@@ -146,7 +153,7 @@ def _run_ytdlp(
     if external_downloader:
         ydl_opts["external_downloader"] = external_downloader
         ydl_opts["external_downloader_args"] = {
-            "aria2c": ["-x", "16", "-k", "1M", "--summary-interval=1"]
+            "aria2c": ["-x", "16", "-k", "5M", "--continue=true", "--max-tries=5", "--retry-wait=3", "--timeout=60", "--summary-interval=1"]
         }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -261,6 +268,7 @@ async def download_url(
     semaphore: asyncio.Semaphore,
     progress_cb: Optional[ProgressCallback] = None,
     external_downloader: Optional[str] = None,
+    max_retries: int = 3,
 ) -> Path:
     loop = asyncio.get_running_loop()
 
@@ -269,18 +277,63 @@ async def download_url(
             asyncio.run_coroutine_threadsafe(progress_cb(text), loop)
 
     async with semaphore:
-        # Try aria2c first if it's available
-        if shutil.which("aria2c"):
-            try:
-                LOGGER.info("Trying aria2c for %s", url)
-                return await _run_aria2c(url, dest_path, progress_cb)
-            except Exception as exc:
-                LOGGER.warning("aria2c failed, falling back to yt-dlp: %s", exc)
+        last_error = None
         
-        # Fallback to yt-dlp
-        return await asyncio.to_thread(
-            _run_ytdlp, url, dest_path, media_format, sync_progress, external_downloader
-        )
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Try aria2c first if it's available
+                if shutil.which("aria2c"):
+                    try:
+                        LOGGER.info("Trying aria2c for %s (attempt %d/%d)", url, attempt, max_retries)
+                        if progress_cb:
+                            await progress_cb(f"downloading (aria2c, attempt {attempt})")
+                        result = await _run_aria2c(url, dest_path, progress_cb)
+                        # Verify file exists and has content
+                        if result.exists() and result.stat().st_size > 0:
+                            return result
+                        else:
+                            raise RuntimeError("aria2c completed but file is empty or missing")
+                    except Exception as exc:
+                        LOGGER.warning("aria2c failed (attempt %d): %s", attempt, exc)
+                        if progress_cb:
+                            await progress_cb(f"aria2c failed, trying yt-dlp...")
+                
+                # Fallback to yt-dlp with timeout
+                LOGGER.info("Trying yt-dlp for %s (attempt %d/%d)", url, attempt, max_retries)
+                if progress_cb:
+                    await progress_cb(f"downloading (yt-dlp, attempt {attempt})")
+                
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _run_ytdlp, url, dest_path, media_format, sync_progress, external_downloader
+                    ),
+                    timeout=300  # 5 minute timeout for yt-dlp
+                )
+                
+                # Verify file exists
+                if result.exists() and result.stat().st_size > 0:
+                    return result
+                else:
+                    raise RuntimeError("yt-dlp completed but file is empty or missing")
+                    
+            except asyncio.TimeoutError:
+                last_error = "Download timed out after 5 minutes"
+                LOGGER.warning("Download timeout (attempt %d/%d): %s", attempt, max_retries, url)
+            except Exception as exc:
+                last_error = str(exc)
+                LOGGER.warning("Download failed (attempt %d/%d): %s", attempt, max_retries, exc)
+            
+            # Wait before retry (exponential backoff: 5s, 10s, 20s)
+            if attempt < max_retries:
+                wait_time = 5 * (2 ** (attempt - 1))
+                if progress_cb:
+                    await progress_cb(f"retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+        
+        # All retries failed
+        if progress_cb:
+            await progress_cb(f"failed: {last_error}")
+        raise RuntimeError(f"Download failed after {max_retries} attempts: {last_error}")
 
 
 async def _probe_video_info(path: Path) -> dict:
