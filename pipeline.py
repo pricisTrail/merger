@@ -81,29 +81,48 @@ class ByteProgress:
             await self.callback("done")
 
 
-# Semaphore to limit concurrent Pyrogram downloads (prevents overwhelming Telegram)
-PYROGRAM_DOWNLOAD_LIMIT = int(os.getenv("PYROGRAM_CONCURRENCY", "4"))
-_pyrogram_semaphore = asyncio.Semaphore(PYROGRAM_DOWNLOAD_LIMIT)
+# Single shared Pyrogram client - stays connected, supports concurrent downloads
+_pyrogram_client: Optional[Client] = None
 _pyrogram_lock = asyncio.Lock()
-_download_counter = 0
 
 
-async def create_pyrogram_client(bot_token: str, name_suffix: str) -> Optional[Client]:
-    """Create a new Pyrogram client for downloading."""
+async def get_pyrogram_client(bot_token: str) -> Optional[Client]:
+    """Get or create a shared Pyrogram client that stays connected."""
+    global _pyrogram_client
+    
     api_id = os.getenv("API_ID")
     api_hash = os.getenv("API_HASH")
     
     if not api_id or not api_hash:
         return None
     
-    client = Client(
-        name=f"dl_{name_suffix}",
-        api_id=int(api_id),
-        api_hash=api_hash,
-        bot_token=bot_token,
-        in_memory=True,
-    )
-    return client
+    async with _pyrogram_lock:
+        if _pyrogram_client is None:
+            _pyrogram_client = Client(
+                name="merger_bot",
+                api_id=int(api_id),
+                api_hash=api_hash,
+                bot_token=bot_token,
+                in_memory=True,
+            )
+            await _pyrogram_client.start()
+            LOGGER.info("Shared Pyrogram client started")
+        elif not _pyrogram_client.is_connected:
+            try:
+                await _pyrogram_client.start()
+                LOGGER.info("Shared Pyrogram client reconnected")
+            except Exception as e:
+                LOGGER.warning("Failed to reconnect, creating new client: %s", e)
+                _pyrogram_client = Client(
+                    name="merger_bot",
+                    api_id=int(api_id),
+                    api_hash=api_hash,
+                    bot_token=bot_token,
+                    in_memory=True,
+                )
+                await _pyrogram_client.start()
+    
+    return _pyrogram_client
 
 
 async def download_telegram_file(
@@ -117,90 +136,71 @@ async def download_telegram_file(
     """Download file from Telegram using Pyrogram (supports up to 2GB).
     Falls back to Bot API for small files if Pyrogram credentials missing.
     """
-    global _download_counter
-    
     async with semaphore:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Use Pyrogram for large file support (up to 2GB)
-        api_id = os.getenv("API_ID")
-        api_hash = os.getenv("API_HASH")
-        
-        if api_id and api_hash:
-            # Limit concurrent Pyrogram downloads
-            async with _pyrogram_semaphore:
-                # Generate unique client name
-                async with _pyrogram_lock:
-                    _download_counter += 1
-                    client_id = _download_counter
-                
-                last_error = None
-                
-                for attempt in range(1, max_retries + 1):
-                    app = None
-                    try:
-                        if progress_cb:
-                            if attempt > 1:
-                                await progress_cb(f"retrying ({attempt}/{max_retries})...")
-                            else:
-                                await progress_cb("connecting...")
-                        
-                        # Create a fresh client for this download
-                        app = await create_pyrogram_client(bot.token, f"{client_id}_{attempt}")
-                        if not app:
-                            break
-                        
-                        await app.start()
-                        LOGGER.info("Pyrogram client %d started for %s", client_id, dest_path.name)
-                        
-                        if progress_cb:
-                            await progress_cb("downloading...")
-                        
-                        last_emit = 0.0
-                        
-                        async def pyrogram_progress(current: int, total: int) -> None:
-                            nonlocal last_emit
-                            now = asyncio.get_event_loop().time()
-                            if now - last_emit > 0.8 and progress_cb:
-                                speed = None
-                                text = format_progress("downloading", current, total, speed)
-                                await progress_cb(text)
-                                last_emit = now
-                        
-                        await app.download_media(
-                            file_id,
-                            file_name=str(dest_path),
-                            progress=pyrogram_progress,
-                        )
-                        
-                        # Verify file was downloaded
-                        if dest_path.exists() and dest_path.stat().st_size > 0:
-                            if progress_cb:
-                                await progress_cb("done")
-                            return
-                        else:
-                            raise RuntimeError("Download completed but file is empty")
-                        
-                    except Exception as exc:
-                        last_error = exc
-                        LOGGER.warning("Pyrogram download attempt %d/%d failed: %s", attempt, max_retries, exc)
-                        
-                        if attempt < max_retries:
-                            await asyncio.sleep(2 * attempt)  # Backoff: 2s, 4s, 6s
-                    
-                    finally:
-                        # Always stop the client
-                        if app:
-                            try:
-                                await app.stop()
-                            except:
-                                pass
-                
-                # All Pyrogram retries failed - raise error for large files
-                if last_error:
+        # Try Pyrogram first (supports files up to 2GB)
+        app = await get_pyrogram_client(bot.token)
+        if app:
+            last_error = None
+            
+            for attempt in range(1, max_retries + 1):
+                try:
                     if progress_cb:
-                        await progress_cb(f"failed: {last_error}")
-                    raise RuntimeError(f"Pyrogram download failed after {max_retries} attempts: {last_error}")
+                        if attempt > 1:
+                            await progress_cb(f"retrying ({attempt}/{max_retries})...")
+                        else:
+                            await progress_cb("downloading...")
+                    
+                    last_emit = 0.0
+                    
+                    async def pyrogram_progress(current: int, total: int) -> None:
+                        nonlocal last_emit
+                        now = asyncio.get_event_loop().time()
+                        if now - last_emit > 0.8 and progress_cb:
+                            speed = None
+                            text = format_progress("downloading", current, total, speed)
+                            await progress_cb(text)
+                            last_emit = now
+                    
+                    # Download using shared client (supports concurrent downloads)
+                    await app.download_media(
+                        file_id,
+                        file_name=str(dest_path),
+                        progress=pyrogram_progress,
+                    )
+                    
+                    # Verify file was downloaded
+                    if dest_path.exists() and dest_path.stat().st_size > 0:
+                        if progress_cb:
+                            await progress_cb("done")
+                        return
+                    else:
+                        raise RuntimeError("Download completed but file is empty")
+                    
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning("Pyrogram download attempt %d/%d failed: %s", attempt, max_retries, exc)
+                    
+                    # Handle FLOOD_WAIT - wait the required time
+                    if "FLOOD_WAIT" in str(exc):
+                        import re
+                        match = re.search(r'(\d+) seconds', str(exc))
+                        if match:
+                            wait_time = int(match.group(1))
+                            if progress_cb:
+                                await progress_cb(f"rate limited, waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time + 5)
+                            continue
+                    
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 * attempt)  # Backoff: 2s, 4s, 6s
+            
+            # All Pyrogram retries failed
+            if last_error:
+                if progress_cb:
+                    await progress_cb(f"failed: {last_error}")
+                raise RuntimeError(f"Pyrogram download failed after {max_retries} attempts: {last_error}")
         
         # Fallback: Bot API (only works for files < 20MB)
         LOGGER.info("Using Bot API for download (limit 20MB)")
