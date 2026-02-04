@@ -40,19 +40,21 @@ def ensure_dependencies() -> None:
 def format_progress(action: str, current: int, total: Optional[int], speed: Optional[float]) -> str:
     percent = "?"
     eta = None
-    if total:
+    total_str = "?"
+    if total and total > 0:
         percent = f"{(current / total) * 100:.1f}%"
-        if speed:
+        total_str = format_bytes(total)
+        if speed and speed > 0:
             eta = max((total - current) / speed, 0)
     parts = [
         action,
         percent,
-        f"{format_bytes(current)}/{format_bytes(total)}",
-        format_speed(speed),
+        f"{format_bytes(current)}/{total_str}",
+        format_speed(speed) if speed else "",
     ]
     if eta is not None:
         parts.append(f"ETA {format_duration(eta)}")
-    return " ".join(parts)
+    return " ".join(p for p in parts if p)
 
 
 class ByteProgress:
