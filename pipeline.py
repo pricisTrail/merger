@@ -81,8 +81,47 @@ class ByteProgress:
 
 # Single shared Pyrogram client - stays connected, supports concurrent downloads
 _pyrogram_client: Optional[Client] = None
-# Pyrogram client configuration
+_pyrogram_bot_token: Optional[str] = None
 _pyrogram_lock = asyncio.Lock()
+
+
+async def _get_pyrogram_client(bot: Bot) -> Client:
+    """Get or create a shared Pyrogram client. Reuses the same client for all downloads."""
+    global _pyrogram_client, _pyrogram_bot_token
+    
+    api_id = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    
+    if not api_id or not api_hash:
+        raise RuntimeError("API_ID or API_HASH not set")
+    
+    async with _pyrogram_lock:
+        # If client exists and is for the same bot, reuse it
+        if _pyrogram_client is not None and _pyrogram_bot_token == bot.token:
+            if _pyrogram_client.is_connected:
+                return _pyrogram_client
+            else:
+                # Client disconnected, clean up
+                try:
+                    await _pyrogram_client.stop()
+                except Exception:
+                    pass
+                _pyrogram_client = None
+        
+        # Create new shared client
+        LOGGER.info("Creating shared Pyrogram client...")
+        _pyrogram_client = Client(
+            name="shared_downloader",
+            api_id=int(api_id),
+            api_hash=api_hash,
+            bot_token=bot.token,
+            in_memory=True,
+            sleep_threshold=60,
+        )
+        await _pyrogram_client.start()
+        _pyrogram_bot_token = bot.token
+        LOGGER.info("Shared Pyrogram client connected!")
+        return _pyrogram_client
 
 
 async def download_telegram_file(
@@ -93,8 +132,9 @@ async def download_telegram_file(
     progress_cb: Optional[ProgressCallback] = None,
     max_retries: int = 3,
 ) -> None:
-    """Download file from Telegram using Pyrogram (supports up to 2GB).
+    """Download file from Telegram using a shared Pyrogram client (supports up to 2GB).
     Falls back to Bot API for small files if Pyrogram credentials missing.
+    Uses a single shared client to avoid FLOOD_WAIT from multiple connections.
     """
     api_id = os.getenv("API_ID")
     api_hash = os.getenv("API_HASH")
@@ -114,37 +154,31 @@ async def download_telegram_file(
                         else:
                             await progress_cb("connecting...")
                     
-                    # Use async context manager - ensures proper connect/disconnect
-                    async with Client(
-                        name=f"dl_{int(time.time())}",
-                        api_id=int(api_id),
-                        api_hash=api_hash,
-                        bot_token=bot.token,
-                        in_memory=True,
-                        sleep_threshold=60,
-                    ) as app:
-                        if progress_cb:
-                            await progress_cb("downloading...")
-                        
-                        last_emit = 0.0
-                        download_start = time.monotonic()
-                        
-                        async def pyrogram_progress(current: int, total: int) -> None:
-                            nonlocal last_emit
-                            now = time.monotonic()
-                            if now - last_emit > 0.8 and progress_cb:
-                                elapsed = max(now - download_start, 0.001)
-                                speed = current / elapsed
-                                text = format_progress("downloading", current, total, speed)
-                                await progress_cb(text)
-                                last_emit = now
-                        
-                        # Download using Pyrogram
-                        await app.download_media(
-                            file_id,
-                            file_name=str(dest_path),
-                            progress=pyrogram_progress,
-                        )
+                    # Get shared client (reuses existing connection)
+                    app = await _get_pyrogram_client(bot)
+                    
+                    if progress_cb:
+                        await progress_cb("downloading...")
+                    
+                    last_emit = 0.0
+                    download_start = time.monotonic()
+                    
+                    async def pyrogram_progress(current: int, total: int) -> None:
+                        nonlocal last_emit
+                        now = time.monotonic()
+                        if now - last_emit > 0.8 and progress_cb:
+                            elapsed = max(now - download_start, 0.001)
+                            speed = current / elapsed
+                            text = format_progress("downloading", current, total, speed)
+                            await progress_cb(text)
+                            last_emit = now
+                    
+                    # Download using shared Pyrogram client
+                    await app.download_media(
+                        file_id,
+                        file_name=str(dest_path),
+                        progress=pyrogram_progress,
+                    )
                     
                     # Verify file was downloaded
                     if dest_path.exists() and dest_path.stat().st_size > 0:
@@ -161,7 +195,7 @@ async def download_telegram_file(
                     LOGGER.warning("Pyrogram download attempt %d/%d failed: %s", 
                                   attempt, max_retries, exc)
                     
-                    # Handle FLOOD_WAIT
+                    # Handle FLOOD_WAIT - but with shared client this should be rare
                     if "FLOOD_WAIT" in str(exc):
                         match = re.search(r'(\d+) seconds', str(exc))
                         if match:
@@ -170,6 +204,17 @@ async def download_telegram_file(
                                 await progress_cb(f"rate limited, waiting {wait_time}s...")
                             await asyncio.sleep(wait_time + 5)
                             continue
+                    
+                    # If connection issue, reset the shared client
+                    if any(err in str(exc).lower() for err in ["disconnect", "connection", "timeout"]):
+                        global _pyrogram_client
+                        async with _pyrogram_lock:
+                            if _pyrogram_client is not None:
+                                try:
+                                    await _pyrogram_client.stop()
+                                except Exception:
+                                    pass
+                                _pyrogram_client = None
                     
                     if attempt < max_retries:
                         await asyncio.sleep(2 * attempt)
