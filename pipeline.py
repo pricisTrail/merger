@@ -84,11 +84,47 @@ class ByteProgress:
 # Single shared Pyrogram client - stays connected, supports concurrent downloads
 _pyrogram_client: Optional[Client] = None
 _pyrogram_lock = asyncio.Lock()
+_keepalive_task: Optional[asyncio.Task] = None
+_active_downloads: int = 0
+_downloads_lock = asyncio.Lock()
+
+
+async def _keepalive_loop(client: Client) -> None:
+    """Background task to keep Pyrogram session alive by sending periodic pings."""
+    LOGGER.info("Keepalive loop started")
+    ping_interval = 25  # Ping every 25 seconds (Telegram usually times out at ~60s)
+    
+    while True:
+        try:
+            await asyncio.sleep(ping_interval)
+            
+            if client is None:
+                LOGGER.debug("Client is None, stopping keepalive")
+                break
+                
+            if not client.is_connected:
+                LOGGER.debug("Client disconnected, stopping keepalive")
+                break
+            
+            # Use get_me() as keepalive - it's lightweight and always works
+            try:
+                await client.get_me()
+                LOGGER.debug("Keepalive ping successful")
+            except Exception as ping_err:
+                LOGGER.warning("Keepalive ping failed: %s", ping_err)
+                # Don't break - let the download functions handle reconnection
+                
+        except asyncio.CancelledError:
+            LOGGER.info("Keepalive task cancelled")
+            break
+        except Exception as e:
+            LOGGER.warning("Keepalive loop error: %s", e)
+            await asyncio.sleep(5)
 
 
 async def get_pyrogram_client(bot_token: str) -> Optional[Client]:
     """Get or create a shared Pyrogram client that stays connected."""
-    global _pyrogram_client
+    global _pyrogram_client, _keepalive_task
     
     api_id = os.getenv("API_ID")
     api_hash = os.getenv("API_HASH")
@@ -97,6 +133,8 @@ async def get_pyrogram_client(bot_token: str) -> Optional[Client]:
         return None
     
     async with _pyrogram_lock:
+        needs_start = False
+        
         if _pyrogram_client is None:
             _pyrogram_client = Client(
                 name="merger_bot",
@@ -104,25 +142,55 @@ async def get_pyrogram_client(bot_token: str) -> Optional[Client]:
                 api_hash=api_hash,
                 bot_token=bot_token,
                 in_memory=True,
+                sleep_threshold=60,  # Handle flood waits up to 60s automatically
             )
-            await _pyrogram_client.start()
-            LOGGER.info("Shared Pyrogram client started")
+            needs_start = True
         elif not _pyrogram_client.is_connected:
             try:
-                await _pyrogram_client.start()
-                LOGGER.info("Shared Pyrogram client reconnected")
+                needs_start = True
             except Exception as e:
-                LOGGER.warning("Failed to reconnect, creating new client: %s", e)
+                LOGGER.warning("Client check failed, recreating: %s", e)
                 _pyrogram_client = Client(
                     name="merger_bot",
                     api_id=int(api_id),
                     api_hash=api_hash,
                     bot_token=bot_token,
                     in_memory=True,
+                    sleep_threshold=60,
                 )
+                needs_start = True
+        
+        if needs_start:
+            try:
                 await _pyrogram_client.start()
+                LOGGER.info("Shared Pyrogram client started/reconnected")
+                
+                # Start keepalive task
+                if _keepalive_task is None or _keepalive_task.done():
+                    _keepalive_task = asyncio.create_task(_keepalive_loop(_pyrogram_client))
+                    LOGGER.info("Keepalive task started")
+            except Exception as e:
+                LOGGER.error("Failed to start Pyrogram client: %s", e)
+                _pyrogram_client = None
+                return None
     
     return _pyrogram_client
+
+
+async def _mark_download_start() -> None:
+    """Track when a download starts to prevent session cleanup."""
+    global _active_downloads
+    async with _downloads_lock:
+        _active_downloads += 1
+        LOGGER.debug("Active downloads: %d", _active_downloads)
+
+
+async def _mark_download_end() -> None:
+    """Track when a download ends."""
+    global _active_downloads
+    async with _downloads_lock:
+        _active_downloads = max(0, _active_downloads - 1)
+        LOGGER.debug("Active downloads: %d", _active_downloads)
 
 
 async def download_telegram_file(
