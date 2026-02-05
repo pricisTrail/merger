@@ -313,6 +313,7 @@ async def _run_aria2c(
     dest_path: Path,
     progress_cb: Optional[ProgressCallback],
 ) -> Path:
+    """Download using aria2c with multi-connection support."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     
     cmd = [
@@ -324,89 +325,64 @@ async def _run_aria2c(
         # Multi-connection settings
         "--max-connection-per-server=16",
         "--split=16",
-        "--min-split-size=5M",
-        "--piece-length=5M",
+        "--min-split-size=1M",
         # Retry & Resume support
         "--continue=true",
         "--max-tries=5",
         "--retry-wait=3",
         "--max-file-not-found=3",
         # Connection timeout handling
-        "--timeout=60",
-        "--connect-timeout=30",
-        "--lowest-speed-limit=10K",
+        "--timeout=120",
+        "--connect-timeout=60",
         "--max-resume-failure-tries=5",
-        # Optimizations
-        "--stream-piece-selector=geom",
-        "--uri-selector=adaptive",
+        # Output settings
+        "--console-log-level=error",
+        "--summary-interval=0",
+        "--download-result=hide",
         "--auto-file-renaming=false",
-        "--summary-interval=1",
-        "--console-log-level=notice",  # Changed to notice for progress output
-        "--download-result=hide",       # Hide download result summary
+        "--human-readable=true",
     ]
+    
+    LOGGER.info("Running aria2c: %s -> %s", url[:80], dest_path.name)
+    
+    if progress_cb:
+        await progress_cb("starting download...")
     
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout for easier parsing
+        stderr=asyncio.subprocess.PIPE,
     )
     
-    last_emit = 0.0
+    try:
+        # Set a generous timeout for the download (30 minutes)
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=1800
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("aria2c download timed out after 30 minutes")
     
-    # aria2c outputs progress to stderr, we merged it into stdout
-    if process.stdout:
-        async for raw in process.stdout:
-            try:
-                line = raw.decode("utf-8", "ignore").strip()
-                if not line:
-                    continue
-                    
-                # aria2c progress line example: [#abc123 50MiB/100MiB(50%) CN:16 DL:5.2MiB ETA:10s]
-                if "[#" in line and "]" in line:
-                    now = time.monotonic()
-                    if now - last_emit < 0.8:
-                        continue  # Throttle updates
-                    last_emit = now
-                    
-                    try:
-                        # Extract content between [ and ]
-                        bracket_content = line[line.find("["):line.find("]")+1]
-                        
-                        # Extract percentage: (50%)
-                        percent_match = re.search(r"\((\d+%)\)", bracket_content)
-                        percent = percent_match.group(1) if percent_match else ""
-                        
-                        # Extract sizes: 50MiB/100MiB
-                        size_match = re.search(r"(\d+\.?\d*[KMGT]?i?B)/(\d+\.?\d*[KMGT]?i?B)", bracket_content)
-                        sizes = f"{size_match.group(1)}/{size_match.group(2)}" if size_match else ""
-                        
-                        # Extract speed: DL:5.2MiB
-                        speed_match = re.search(r"DL:(\d+\.?\d*[KMGT]?i?B)", bracket_content)
-                        speed = f"{speed_match.group(1)}/s" if speed_match else ""
-                        
-                        # Extract ETA: ETA:10s
-                        eta_match = re.search(r"ETA:(\S+)", bracket_content)
-                        eta = f"ETA {eta_match.group(1)}" if eta_match else ""
-                        
-                        # Build progress text
-                        parts = [p for p in [percent, sizes, speed, eta] if p]
-                        if parts and progress_cb:
-                            await progress_cb(" ".join(parts))
-                            
-                    except Exception:
-                        # Fallback: just show a simplified version
-                        if progress_cb:
-                            await progress_cb("downloading...")
-                            
-            except Exception:
-                continue
-
-    await process.wait()
+    if progress_cb:
+        await progress_cb("done")
     
     if process.returncode != 0:
-        # Try to get error message
-        raise RuntimeError(f"aria2c exited with code {process.returncode}")
+        error_msg = stderr.decode("utf-8", "ignore").strip() if stderr else ""
+        if not error_msg:
+            error_msg = stdout.decode("utf-8", "ignore").strip() if stdout else ""
+        raise RuntimeError(f"aria2c failed (code {process.returncode}): {error_msg[:200]}")
     
+    # Verify file was downloaded
+    if not dest_path.exists():
+        raise RuntimeError(f"aria2c completed but file not found: {dest_path.name}")
+    
+    if dest_path.stat().st_size == 0:
+        dest_path.unlink(missing_ok=True)
+        raise RuntimeError("aria2c completed but file is empty")
+    
+    LOGGER.info("Download complete: %s (%d bytes)", dest_path.name, dest_path.stat().st_size)
     return dest_path
 
 
