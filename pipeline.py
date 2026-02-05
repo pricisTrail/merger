@@ -14,7 +14,6 @@ import aiohttp
 import os
 from aiogram import Bot
 from aiogram.types import FSInputFile
-from yt_dlp import YoutubeDL
 from pyrogram import Client
 
 from utils import format_bytes, format_duration, format_speed
@@ -23,7 +22,6 @@ DOWNLOAD_CHUNK_SIZE = 512 * 1024
 LOGGER = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[str], Awaitable[None]]
-SyncProgressCallback = Optional[Callable[[str], None]]
 
 
 class ToolMissingError(RuntimeError):
@@ -309,133 +307,6 @@ async def download_telegram_file(
         await progress.done()
 
 
-def _run_ytdlp(
-    url: str,
-    dest_path: Path,
-    media_format: str,
-    progress_cb: SyncProgressCallback,
-    external_downloader: Optional[str],
-) -> Path:
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    base_path = dest_path
-    if base_path.suffix:
-        base_path = base_path.with_suffix("")
-
-    def emit(text: str) -> None:
-        if progress_cb:
-            progress_cb(text)
-
-    def hook(status: dict) -> None:
-        if status.get("status") == "downloading":
-            total = status.get("total_bytes") or status.get("total_bytes_estimate")
-            downloaded = status.get("downloaded_bytes", 0)
-            speed = status.get("speed")
-            emit(format_progress("downloading", downloaded, total, speed))
-        elif status.get("status") == "finished":
-            emit("processing")
-
-    ydl_opts = {
-        "outtmpl": f"{base_path}.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "progress_hooks": [hook],
-        "overwrites": True,
-        # Timeout and retry settings
-        "socket_timeout": 120,          # 2 minute socket timeout
-        "retries": 3,                   # Retry download 3 times
-        "fragment_retries": 5,          # Retry fragments 5 times
-        "retry_sleep_functions": {"http": lambda n: 5 * (n + 1)},  # Exponential backoff
-        "file_access_retries": 3,       # Retry file access
-        "extractor_retries": 3,         # Retry extractor
-    }
-    if media_format == "audio":
-        ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
-    else:
-        ydl_opts["format"] = "bestvideo[ext=mp4]/bestvideo/best"
-    if external_downloader:
-        ydl_opts["external_downloader"] = external_downloader
-        ydl_opts["external_downloader_args"] = {
-            "aria2c": ["-x", "16", "-k", "5M", "--continue=true", "--max-tries=5", "--retry-wait=3", "--timeout=60", "--summary-interval=1"]
-        }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = None
-        if isinstance(info, dict):
-            requested = info.get("requested_downloads")
-            if requested:
-                filename = requested[0].get("filepath") or requested[0].get("filename")
-            if not filename:
-                filename = info.get("filepath")
-        if not filename:
-            filename = ydl.prepare_filename(info)
-    emit("done")
-    return Path(filename)
-
-
-async def _run_wget(
-    url: str,
-    dest_path: Path,
-    progress_cb: Optional[ProgressCallback],
-) -> Path:
-    """Download using wget with retry, resume, and timeout support."""
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    cmd = [
-        "wget",
-        url,
-        "-O", str(dest_path),
-        # Retry & Resume
-        "--tries=5",                    # Retry up to 5 times
-        "--continue",                   # Resume partial downloads
-        "--waitretry=3",                # Wait 3 seconds between retries
-        # Timeout handling
-        "--timeout=60",                 # Network timeout 60s
-        "--dns-timeout=30",             # DNS lookup timeout
-        "--connect-timeout=30",         # Connection timeout
-        "--read-timeout=120",           # Read timeout 2 minutes
-        # Optimizations
-        "--no-check-certificate",       # Skip SSL verification for speed
-        "--progress=bar:force:noscroll", # Show progress
-        "-q", "--show-progress",        # Quiet but show progress bar
-    ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    
-    last_emit = 0.0
-    if process.stderr:  # wget outputs progress to stderr
-        async for raw in process.stderr:
-            try:
-                line = raw.decode("utf-8", "ignore").strip()
-                # wget progress: 50% [=====>     ] 50M  10.5M/s eta 5s
-                if "%" in line:
-                    now = asyncio.get_event_loop().time()
-                    if now - last_emit > 0.8 and progress_cb:
-                        # Clean up the progress line
-                        await progress_cb(f"wget: {line[:60]}")
-                        last_emit = now
-            except Exception:
-                continue
-
-    stdout, stderr = await process.communicate()
-    
-    if process.returncode != 0:
-        error = stderr.decode("utf-8", "ignore").strip() if stderr else "wget failed"
-        raise RuntimeError(error)
-    
-    # Verify file exists and has content
-    if not dest_path.exists() or dest_path.stat().st_size == 0:
-        raise RuntimeError("wget completed but file is empty or missing")
-    
-    if progress_cb:
-        await progress_cb("done")
-    
-    return dest_path
-
 
 async def _run_aria2c(
     url: str,
@@ -537,80 +408,42 @@ async def download_url(
     external_downloader: Optional[str] = None,
     max_retries: int = 3,
 ) -> Path:
-    loop = asyncio.get_running_loop()
-
-    def sync_progress(text: str) -> None:
-        if progress_cb:
-            asyncio.run_coroutine_threadsafe(progress_cb(text), loop)
+    """Download a URL using aria2c only."""
+    
+    if not shutil.which("aria2c"):
+        raise RuntimeError("aria2c not found in PATH - required for downloads")
 
     async with semaphore:
         last_error = None
         
         for attempt in range(1, max_retries + 1):
             try:
-                # ENGINE 1: Try wget first (simple, reliable, good resume support)
-                if shutil.which("wget"):
-                    try:
-                        LOGGER.info("Trying wget for %s (attempt %d/%d)", url, attempt, max_retries)
-                        if progress_cb:
-                            await progress_cb(f"downloading (wget, attempt {attempt})")
-                        result = await _run_wget(url, dest_path, progress_cb)
-                        if result.exists() and result.stat().st_size > 0:
-                            return result
-                        else:
-                            raise RuntimeError("wget completed but file is empty or missing")
-                    except Exception as exc:
-                        LOGGER.warning("wget failed (attempt %d): %s", attempt, exc)
-                        if progress_cb:
-                            await progress_cb(f"wget failed, trying aria2c...")
-                
-                # ENGINE 2: Try aria2c (multi-connection, faster for large files)
-                if shutil.which("aria2c"):
-                    try:
-                        LOGGER.info("Trying aria2c for %s (attempt %d/%d)", url, attempt, max_retries)
-                        if progress_cb:
-                            await progress_cb(f"downloading (aria2c, attempt {attempt})")
-                        result = await _run_aria2c(url, dest_path, progress_cb)
-                        if result.exists() and result.stat().st_size > 0:
-                            return result
-                        else:
-                            raise RuntimeError("aria2c completed but file is empty or missing")
-                    except Exception as exc:
-                        LOGGER.warning("aria2c failed (attempt %d): %s", attempt, exc)
-                        if progress_cb:
-                            await progress_cb(f"aria2c failed, trying yt-dlp...")
-                
-                # ENGINE 3: Fallback to yt-dlp (handles complex sites, authentication, etc.)
-                LOGGER.info("Trying yt-dlp for %s (attempt %d/%d)", url, attempt, max_retries)
+                LOGGER.info("Downloading with aria2c: %s (attempt %d/%d)", url, attempt, max_retries)
                 if progress_cb:
-                    await progress_cb(f"downloading (yt-dlp, attempt {attempt})")
+                    if attempt > 1:
+                        await progress_cb(f"retrying ({attempt}/{max_retries})...")
+                    else:
+                        await progress_cb("downloading...")
                 
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        _run_ytdlp, url, dest_path, media_format, sync_progress, external_downloader
-                    ),
-                    timeout=300  # 5 minute timeout for yt-dlp
-                )
+                result = await _run_aria2c(url, dest_path, progress_cb)
                 
-                # Verify file exists
+                # Verify file exists and has content
                 if result.exists() and result.stat().st_size > 0:
+                    LOGGER.info("Download complete: %s (%d bytes)", result.name, result.stat().st_size)
                     return result
                 else:
-                    raise RuntimeError("yt-dlp completed but file is empty or missing")
+                    raise RuntimeError("aria2c completed but file is empty or missing")
                     
-            except asyncio.TimeoutError:
-                last_error = "Download timed out after 5 minutes"
-                LOGGER.warning("Download timeout (attempt %d/%d): %s", attempt, max_retries, url)
             except Exception as exc:
                 last_error = str(exc)
-                LOGGER.warning("Download failed (attempt %d/%d): %s", attempt, max_retries, exc)
-            
-            # Wait before retry (exponential backoff: 5s, 10s, 20s)
-            if attempt < max_retries:
-                wait_time = 5 * (2 ** (attempt - 1))
-                if progress_cb:
-                    await progress_cb(f"retrying in {wait_time}s...")
-                await asyncio.sleep(wait_time)
+                LOGGER.warning("aria2c failed (attempt %d/%d): %s", attempt, max_retries, exc)
+                
+                # Wait before retry (exponential backoff: 3s, 6s, 12s)
+                if attempt < max_retries:
+                    wait_time = 3 * (2 ** (attempt - 1))
+                    if progress_cb:
+                        await progress_cb(f"failed, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
         
         # All retries failed
         if progress_cb:
