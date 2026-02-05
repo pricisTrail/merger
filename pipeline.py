@@ -81,114 +81,8 @@ class ByteProgress:
 
 # Single shared Pyrogram client - stays connected, supports concurrent downloads
 _pyrogram_client: Optional[Client] = None
+# Pyrogram client configuration
 _pyrogram_lock = asyncio.Lock()
-_keepalive_task: Optional[asyncio.Task] = None
-_active_downloads: int = 0
-_downloads_lock = asyncio.Lock()
-
-
-async def _keepalive_loop(client: Client) -> None:
-    """Background task to keep Pyrogram session alive by sending periodic pings."""
-    LOGGER.info("Keepalive loop started")
-    ping_interval = 25  # Ping every 25 seconds (Telegram usually times out at ~60s)
-    
-    while True:
-        try:
-            await asyncio.sleep(ping_interval)
-            
-            if client is None:
-                LOGGER.debug("Client is None, stopping keepalive")
-                break
-                
-            if not client.is_connected:
-                LOGGER.debug("Client disconnected, stopping keepalive")
-                break
-            
-            # Use get_me() as keepalive - it's lightweight and always works
-            try:
-                await client.get_me()
-                LOGGER.debug("Keepalive ping successful")
-            except Exception as ping_err:
-                LOGGER.warning("Keepalive ping failed: %s", ping_err)
-                # Don't break - let the download functions handle reconnection
-                
-        except asyncio.CancelledError:
-            LOGGER.info("Keepalive task cancelled")
-            break
-        except Exception as e:
-            LOGGER.warning("Keepalive loop error: %s", e)
-            await asyncio.sleep(5)
-
-
-async def get_pyrogram_client(bot_token: str) -> Optional[Client]:
-    """Get or create a shared Pyrogram client that stays connected."""
-    global _pyrogram_client, _keepalive_task
-    
-    api_id = os.getenv("API_ID")
-    api_hash = os.getenv("API_HASH")
-    
-    if not api_id or not api_hash:
-        return None
-    
-    async with _pyrogram_lock:
-        needs_start = False
-        
-        if _pyrogram_client is None:
-            _pyrogram_client = Client(
-                name="merger_bot",
-                api_id=int(api_id),
-                api_hash=api_hash,
-                bot_token=bot_token,
-                in_memory=True,
-                sleep_threshold=60,  # Handle flood waits up to 60s automatically
-            )
-            needs_start = True
-        elif not _pyrogram_client.is_connected:
-            try:
-                needs_start = True
-            except Exception as e:
-                LOGGER.warning("Client check failed, recreating: %s", e)
-                _pyrogram_client = Client(
-                    name="merger_bot",
-                    api_id=int(api_id),
-                    api_hash=api_hash,
-                    bot_token=bot_token,
-                    in_memory=True,
-                    sleep_threshold=60,
-                )
-                needs_start = True
-        
-        if needs_start:
-            try:
-                await _pyrogram_client.start()
-                LOGGER.info("Shared Pyrogram client started/reconnected")
-                
-                # Start keepalive task
-                if _keepalive_task is None or _keepalive_task.done():
-                    _keepalive_task = asyncio.create_task(_keepalive_loop(_pyrogram_client))
-                    LOGGER.info("Keepalive task started")
-            except Exception as e:
-                LOGGER.error("Failed to start Pyrogram client: %s", e)
-                _pyrogram_client = None
-                return None
-    
-    return _pyrogram_client
-
-
-async def _mark_download_start() -> None:
-    """Track when a download starts to prevent session cleanup."""
-    global _active_downloads
-    async with _downloads_lock:
-        _active_downloads += 1
-        LOGGER.debug("Active downloads: %d", _active_downloads)
-
-
-async def _mark_download_end() -> None:
-    """Track when a download ends."""
-    global _active_downloads
-    async with _downloads_lock:
-        _active_downloads = max(0, _active_downloads - 1)
-        LOGGER.debug("Active downloads: %d", _active_downloads)
 
 
 async def download_telegram_file(
@@ -202,30 +96,35 @@ async def download_telegram_file(
     """Download file from Telegram using Pyrogram (supports up to 2GB).
     Falls back to Bot API for small files if Pyrogram credentials missing.
     """
+    api_id = os.getenv("API_ID")
+    api_hash = os.getenv("API_HASH")
+    
     async with semaphore:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Try Pyrogram first (supports files up to 2GB)
-        app = await get_pyrogram_client(bot.token)
-        if app:
-            await _mark_download_start()
+        # Try Pyrogram if credentials available (supports files up to 2GB)
+        if api_id and api_hash:
             last_error = None
             
-            try:
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        # Ensure client is still connected before each attempt
-                        if not app.is_connected:
-                            LOGGER.warning("Pyrogram client disconnected, reconnecting...")
-                            app = await get_pyrogram_client(bot.token)
-                            if not app:
-                                raise RuntimeError("Failed to get Pyrogram client")
-                        
+            for attempt in range(1, max_retries + 1):
+                try:
+                    if progress_cb:
+                        if attempt > 1:
+                            await progress_cb(f"retrying ({attempt}/{max_retries})...")
+                        else:
+                            await progress_cb("connecting...")
+                    
+                    # Use async context manager - ensures proper connect/disconnect
+                    async with Client(
+                        name=f"dl_{int(time.time())}",
+                        api_id=int(api_id),
+                        api_hash=api_hash,
+                        bot_token=bot.token,
+                        in_memory=True,
+                        sleep_threshold=60,
+                    ) as app:
                         if progress_cb:
-                            if attempt > 1:
-                                await progress_cb(f"retrying ({attempt}/{max_retries})...")
-                            else:
-                                await progress_cb("downloading...")
+                            await progress_cb("downloading...")
                         
                         last_emit = 0.0
                         download_start = time.monotonic()
@@ -240,61 +139,58 @@ async def download_telegram_file(
                                 await progress_cb(text)
                                 last_emit = now
                         
-                        # Download using shared client (supports concurrent downloads)
+                        # Download using Pyrogram
                         await app.download_media(
                             file_id,
                             file_name=str(dest_path),
                             progress=pyrogram_progress,
                         )
-                        
-                        # Verify file was downloaded
-                        if dest_path.exists() and dest_path.stat().st_size > 0:
+                    
+                    # Verify file was downloaded
+                    if dest_path.exists() and dest_path.stat().st_size > 0:
+                        if progress_cb:
+                            await progress_cb("done")
+                        LOGGER.info("Pyrogram download complete: %s (%d bytes)", 
+                                   dest_path.name, dest_path.stat().st_size)
+                        return
+                    else:
+                        raise RuntimeError("Download completed but file is empty")
+                    
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning("Pyrogram download attempt %d/%d failed: %s", 
+                                  attempt, max_retries, exc)
+                    
+                    # Handle FLOOD_WAIT
+                    if "FLOOD_WAIT" in str(exc):
+                        match = re.search(r'(\d+) seconds', str(exc))
+                        if match:
+                            wait_time = int(match.group(1))
                             if progress_cb:
-                                await progress_cb("done")
-                            return
-                        else:
-                            raise RuntimeError("Download completed but file is empty")
-                        
-                    except Exception as exc:
-                        last_error = exc
-                        LOGGER.warning("Pyrogram download attempt %d/%d failed: %s", attempt, max_retries, exc)
-                        
-                        # Handle FLOOD_WAIT - wait the required time
-                        if "FLOOD_WAIT" in str(exc):
-                            match = re.search(r'(\d+) seconds', str(exc))
-                            if match:
-                                wait_time = int(match.group(1))
-                                if progress_cb:
-                                    await progress_cb(f"rate limited, waiting {wait_time}s...")
-                                await asyncio.sleep(wait_time + 5)
-                                continue
-                        
-                        # Connection errors - try to reconnect
-                        exc_str = str(exc).lower()
-                        if any(x in exc_str for x in ['disconnect', 'connection', 'network', 'timeout', 'eof']):
-                            LOGGER.warning("Connection issue detected, forcing reconnect")
-                            # Force get a fresh client on next attempt
-                            app = await get_pyrogram_client(bot.token)
-                        
-                        if attempt < max_retries:
-                            await asyncio.sleep(2 * attempt)  # Backoff: 2s, 4s, 6s
-                
-                # All Pyrogram retries failed
-                if last_error:
-                    if progress_cb:
-                        await progress_cb(f"failed: {last_error}")
-                    raise RuntimeError(f"Pyrogram download failed after {max_retries} attempts: {last_error}")
-            finally:
-                await _mark_download_end()
+                                await progress_cb(f"rate limited, waiting {wait_time}s...")
+                            await asyncio.sleep(wait_time + 5)
+                            continue
+                    
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 * attempt)
+            
+            # All Pyrogram retries failed - fall back to Bot API
+            LOGGER.warning("Pyrogram failed after %d attempts, trying Bot API: %s", 
+                          max_retries, last_error)
         
         # Fallback: Bot API (only works for files < 20MB)
+        if progress_cb:
+            await progress_cb("downloading (Bot API)...")
+        
         LOGGER.info("Using Bot API for download (limit 20MB)")
         file = await bot.get_file(file_id)
         if not file.file_path:
             raise RuntimeError("Telegram file path missing")
+        
         url = f"https://api.telegram.org/file/bot{bot.token}/{file.file_path}"
         total = file.file_size
         progress = ByteProgress("downloading", total, progress_cb)
+        
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 resp.raise_for_status()
@@ -304,7 +200,10 @@ async def download_telegram_file(
                         await handle.write(chunk)
                         downloaded += len(chunk)
                         await progress.emit(downloaded)
+        
         await progress.done()
+        LOGGER.info("Bot API download complete: %s (%d bytes)", 
+                   dest_path.name, dest_path.stat().st_size)
 
 
 

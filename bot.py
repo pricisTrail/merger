@@ -27,7 +27,6 @@ from pipeline import (
     download_telegram_file,
     download_url,
     ensure_dependencies,
-    get_pyrogram_client,
     merge_stream_copy,
     upload_with_progress,
 )
@@ -702,19 +701,6 @@ def main() -> None:
 
     async def on_startup(*_args, **_kwargs) -> None:
         asyncio.create_task(_set_webhook_background())
-        # Initialize Pyrogram client at startup to keep it connected
-        asyncio.create_task(_init_pyrogram(token))
-    
-    async def _init_pyrogram(bot_token: str) -> None:
-        """Initialize Pyrogram client at startup for persistent connection."""
-        try:
-            client = await get_pyrogram_client(bot_token)
-            if client:
-                LOGGER.info("Pyrogram client pre-initialized at startup")
-            else:
-                LOGGER.warning("Pyrogram client not initialized (missing API_ID/API_HASH)")
-        except Exception as e:
-            LOGGER.warning("Failed to pre-initialize Pyrogram client: %s", e)
 
     async def on_shutdown(*_args, **_kwargs) -> None:
         LOGGER.info("Shutting down...")
