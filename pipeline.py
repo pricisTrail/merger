@@ -324,77 +324,88 @@ async def _run_aria2c(
         # Multi-connection settings
         "--max-connection-per-server=16",
         "--split=16",
-        "--min-split-size=5M",              # Optimized chunk size (5MB per chunk)
-        "--piece-length=5M",                # Piece length for better parallel downloads
+        "--min-split-size=5M",
+        "--piece-length=5M",
         # Retry & Resume support
-        "--continue=true",                  # Resume partial/interrupted downloads
-        "--max-tries=5",                    # Retry up to 5 times on failure
-        "--retry-wait=3",                   # Wait 3 seconds between retries
-        "--max-file-not-found=3",           # Retry if server returns file not found
+        "--continue=true",
+        "--max-tries=5",
+        "--retry-wait=3",
+        "--max-file-not-found=3",
         # Connection timeout handling
-        "--timeout=60",                     # Overall connection timeout (60s)
-        "--connect-timeout=30",             # Initial connection timeout (30s)
-        "--lowest-speed-limit=10K",         # Drop connections slower than 10KB/s
-        "--max-resume-failure-tries=5",     # Resume retry attempts
+        "--timeout=60",
+        "--connect-timeout=30",
+        "--lowest-speed-limit=10K",
+        "--max-resume-failure-tries=5",
         # Optimizations
-        "--stream-piece-selector=geom",     # Geometric piece selection for streaming
-        "--uri-selector=adaptive",          # Adaptive URI selection
-        "--auto-file-renaming=false",       # Don't rename on conflict
+        "--stream-piece-selector=geom",
+        "--uri-selector=adaptive",
+        "--auto-file-renaming=false",
         "--summary-interval=1",
-        "--console-log-level=warn",         # Reduce log noise
+        "--console-log-level=notice",  # Changed to notice for progress output
+        "--download-result=hide",       # Hide download result summary
     ]
     
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,  # Merge stderr into stdout for easier parsing
     )
     
-    # Progress parsing for aria2c (simplified)
+    last_emit = 0.0
+    
+    # aria2c outputs progress to stderr, we merged it into stdout
     if process.stdout:
         async for raw in process.stdout:
             try:
                 line = raw.decode("utf-8", "ignore").strip()
-                # Example aria2c output: [#b037be 1.1GiB/1.1GiB(99%) CN:1 DL:2.8MiB ETA:13s]
-                # We want: 99% 1.1GiB/1.1GiB 2.8MiB/s ETA 13s
-                if "[" in line and "]" in line and "(" in line in line:
+                if not line:
+                    continue
+                    
+                # aria2c progress line example: [#abc123 50MiB/100MiB(50%) CN:16 DL:5.2MiB ETA:10s]
+                if "[#" in line and "]" in line:
+                    now = time.monotonic()
+                    if now - last_emit < 0.8:
+                        continue  # Throttle updates
+                    last_emit = now
+                    
                     try:
-                        # Extract percentage: (99%)
-                        percent_match = re.search(r"\((\d+%)\)", line)
+                        # Extract content between [ and ]
+                        bracket_content = line[line.find("["):line.find("]")+1]
+                        
+                        # Extract percentage: (50%)
+                        percent_match = re.search(r"\((\d+%)\)", bracket_content)
                         percent = percent_match.group(1) if percent_match else ""
                         
-                        # Extract sizes: 1.1GiB/1.1GiB
-                        size_match = re.search(r"(\d+\.?\d*[KMGT]i?B/\d+\.?\d*[KMGT]i?B)", line)
-                        sizes = size_match.group(1) if size_match else ""
+                        # Extract sizes: 50MiB/100MiB
+                        size_match = re.search(r"(\d+\.?\d*[KMGT]?i?B)/(\d+\.?\d*[KMGT]?i?B)", bracket_content)
+                        sizes = f"{size_match.group(1)}/{size_match.group(2)}" if size_match else ""
                         
-                        # Extract speed: DL:2.8MiB
-                        speed_match = re.search(r"DL:(\d+\.?\d*[KMGT]i?B)", line)
+                        # Extract speed: DL:5.2MiB
+                        speed_match = re.search(r"DL:(\d+\.?\d*[KMGT]?i?B)", bracket_content)
                         speed = f"{speed_match.group(1)}/s" if speed_match else ""
                         
-                        # Extract ETA: ETA:13s
-                        eta_match = re.search(r"ETA:(\w+)", line)
+                        # Extract ETA: ETA:10s
+                        eta_match = re.search(r"ETA:(\S+)", bracket_content)
                         eta = f"ETA {eta_match.group(1)}" if eta_match else ""
                         
-                        text = f"{percent} {sizes} {speed} {eta}".strip()
-                        if text and progress_cb:
-                            await progress_cb(text)
+                        # Build progress text
+                        parts = [p for p in [percent, sizes, speed, eta] if p]
+                        if parts and progress_cb:
+                            await progress_cb(" ".join(parts))
+                            
                     except Exception:
-                        # Fallback to cleaned raw line if regex fails
-                        status_line = line[line.find("[")+1 : line.find("]")]
+                        # Fallback: just show a simplified version
                         if progress_cb:
-                            await progress_cb(status_line)
-                elif "download completed" in line.lower():
-                    if progress_cb:
-                        await progress_cb("done")
+                            await progress_cb("downloading...")
+                            
             except Exception:
                 continue
 
-    stdout, stderr = await process.communicate()
-    if progress_cb:
-        await progress_cb("done")
+    await process.wait()
+    
     if process.returncode != 0:
-        error = stderr.decode("utf-8", "ignore").strip() if stderr else "aria2c failed"
-        raise RuntimeError(error)
+        # Try to get error message
+        raise RuntimeError(f"aria2c exited with code {process.returncode}")
     
     return dest_path
 
