@@ -130,8 +130,9 @@ async def process_single_merge(
     ACTIVE_TRACKERS[chat_id].append(tracker)
     await tracker.start()
 
-    video_path = job_dir / safe_filename(video_name or f"video_{job_id}.mp4")
-    audio_path = job_dir / safe_filename(audio_name or f"audio_{job_id}.mp3")
+    # Prefix filenames to prevent collision when video and audio have same name
+    video_path = job_dir / safe_filename(f"v_{video_name}" if video_name else f"v_video_{job_id}.mp4")
+    audio_path = job_dir / safe_filename(f"a_{audio_name}" if audio_name else f"a_audio_{job_id}.mp3")
     output_path = job_dir / safe_filename(output_name)
 
     async def video_cb(text: str) -> None:
@@ -187,8 +188,9 @@ async def process_single_merge_with_name(
     ACTIVE_TRACKERS[chat_id].append(tracker)
     await tracker.start()
 
-    video_path = job_dir / safe_filename(video_name)
-    audio_path = job_dir / safe_filename(audio_name)
+    # Prefix filenames to prevent collision when video and audio have same name
+    video_path = job_dir / safe_filename(f"v_{video_name}")
+    audio_path = job_dir / safe_filename(f"a_{audio_name}")
     output_path = job_dir / safe_filename(output_name)
 
     async def video_cb(text: str) -> None:

@@ -403,6 +403,35 @@ async def _probe_duration(path: Path) -> Optional[float]:
     return float(info["duration"]) if "duration" in info else None
 
 
+async def _probe_streams(path: Path) -> dict:
+    """Probe a file for video and audio streams."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "stream=codec_type",
+        "-of", "json",
+        str(path)
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        return {"has_video": False, "has_audio": False}
+    
+    import json
+    try:
+        data = json.loads(stdout.decode())
+        streams = data.get("streams", [])
+        has_video = any(s.get("codec_type") == "video" for s in streams)
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        return {"has_video": has_video, "has_audio": has_audio}
+    except (ValueError, KeyError):
+        return {"has_video": False, "has_audio": False}
+
+
 async def merge_stream_copy(
     video_path: Path,
     audio_path: Path,
@@ -410,6 +439,15 @@ async def merge_stream_copy(
     progress_cb: Optional[ProgressCallback] = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Validate inputs: check audio file actually has audio, and they're not the same file
+    if video_path.resolve() == audio_path.resolve():
+        raise RuntimeError("Video and audio paths are the same file - merge aborted")
+    
+    audio_streams = await _probe_streams(audio_path)
+    if not audio_streams.get("has_audio"):
+        raise RuntimeError(f"Audio file '{audio_path.name}' has no audio stream - cannot merge")
+    
     duration_video, duration_audio = await asyncio.gather(
         _probe_duration(video_path), _probe_duration(audio_path)
     )
