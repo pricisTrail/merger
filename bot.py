@@ -9,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, List, Optional
+from typing import Awaitable, Callable, Deque, Dict, List, Optional
 
 import aiofiles
 from aiohttp import web
@@ -85,6 +85,7 @@ QUEUE_NEXT_ID = 1
 RUNNING_QUEUE_JOB: Optional[QueuedTelegramMergeJob] = None
 RUNNING_QUEUE_TASK: Optional[asyncio.Task] = None
 QUEUE_WORKER_TASK: Optional[asyncio.Task] = None
+PREFETCHED_QUEUE_JOB: Optional[QueuedTelegramMergeJob] = None
 QUEUE_SHUTTING_DOWN = False
 
 
@@ -110,6 +111,8 @@ async def enqueue_telegram_merge(job: QueuedTelegramMergeJob) -> int:
         MERGE_QUEUE.append(job)
         position = len(MERGE_QUEUE)
         if RUNNING_QUEUE_JOB is not None:
+            position += 1
+        if PREFETCHED_QUEUE_JOB is not None:
             position += 1
         QUEUE_EVENT.set()
         return position
@@ -142,17 +145,28 @@ async def queue_counts(chat_id: int) -> tuple[int, int]:
     async with QUEUE_LOCK:
         running = 1 if RUNNING_QUEUE_JOB and RUNNING_QUEUE_JOB.chat_id == chat_id else 0
         queued = sum(1 for item in MERGE_QUEUE if item.chat_id == chat_id)
+        # If no job is currently running, surface a prefetched job as queued.
+        if (
+            running == 0
+            and PREFETCHED_QUEUE_JOB is not None
+            and PREFETCHED_QUEUE_JOB.chat_id == chat_id
+        ):
+            queued += 1
         return running, queued
 
 
 async def prune_queued_jobs(chat_id: int) -> int:
+    global PREFETCHED_QUEUE_JOB
     async with QUEUE_LOCK:
         before = len(MERGE_QUEUE)
         kept = deque(item for item in MERGE_QUEUE if item.chat_id != chat_id)
         removed = before - len(kept)
+        if PREFETCHED_QUEUE_JOB is not None and PREFETCHED_QUEUE_JOB.chat_id == chat_id:
+            PREFETCHED_QUEUE_JOB = None
+            removed += 1
         MERGE_QUEUE.clear()
         MERGE_QUEUE.extend(kept)
-        if not MERGE_QUEUE and RUNNING_QUEUE_JOB is None:
+        if not MERGE_QUEUE and RUNNING_QUEUE_JOB is None and PREFETCHED_QUEUE_JOB is None:
             QUEUE_EVENT.clear()
         return removed
 
@@ -264,6 +278,7 @@ async def process_single_merge_with_name(
     video_name: str,
     audio_name: str,
     output_name: str,
+    on_upload_start: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> None:
     job_id = int(time.time())
     output_name = ensure_mp4_name(output_name)
@@ -305,6 +320,8 @@ async def process_single_merge_with_name(
         await tracker.update(1, merge="waiting")
         async with MERGE_SEMAPHORE:
             await merge_stream_copy(video_path, audio_path, output_path, merge_cb)
+        if on_upload_start:
+            await on_upload_start()
         await tracker.update(1, upload="starting")
         await upload_with_progress(bot, chat_id, output_path, output_name, upload_cb, destination_id=dest)
     except Exception as exc:
@@ -318,17 +335,36 @@ async def process_single_merge_with_name(
 
 
 async def merge_queue_worker(bot: Bot) -> None:
-    global RUNNING_QUEUE_JOB, RUNNING_QUEUE_TASK
+    global RUNNING_QUEUE_JOB, RUNNING_QUEUE_TASK, PREFETCHED_QUEUE_JOB
     while True:
         await QUEUE_EVENT.wait()
         async with QUEUE_LOCK:
-            if not MERGE_QUEUE:
+            if PREFETCHED_QUEUE_JOB is not None:
+                job = PREFETCHED_QUEUE_JOB
+                PREFETCHED_QUEUE_JOB = None
+            elif MERGE_QUEUE:
+                job = MERGE_QUEUE.popleft()
+            else:
                 QUEUE_EVENT.clear()
                 continue
-            job = MERGE_QUEUE.popleft()
             RUNNING_QUEUE_JOB = job
-            if not MERGE_QUEUE:
+            if not MERGE_QUEUE and PREFETCHED_QUEUE_JOB is None:
                 QUEUE_EVENT.clear()
+
+        async def on_upload_start() -> None:
+            global PREFETCHED_QUEUE_JOB
+            async with QUEUE_LOCK:
+                if PREFETCHED_QUEUE_JOB is None and MERGE_QUEUE:
+                    PREFETCHED_QUEUE_JOB = MERGE_QUEUE.popleft()
+                    LOGGER.info(
+                        "Prefetched queued merge job %s during upload stage.",
+                        PREFETCHED_QUEUE_JOB.queue_id,
+                    )
+                if MERGE_QUEUE or PREFETCHED_QUEUE_JOB is not None:
+                    QUEUE_EVENT.set()
+                else:
+                    QUEUE_EVENT.clear()
+
         try:
             RUNNING_QUEUE_TASK = asyncio.create_task(
                 process_single_merge_with_name(
@@ -339,6 +375,7 @@ async def merge_queue_worker(bot: Bot) -> None:
                     video_name=job.video_name,
                     audio_name=job.audio_name,
                     output_name=job.output_name,
+                    on_upload_start=on_upload_start,
                 )
             )
             await RUNNING_QUEUE_TASK
@@ -352,7 +389,7 @@ async def merge_queue_worker(bot: Bot) -> None:
             RUNNING_QUEUE_TASK = None
             async with QUEUE_LOCK:
                 RUNNING_QUEUE_JOB = None
-                if MERGE_QUEUE:
+                if MERGE_QUEUE or PREFETCHED_QUEUE_JOB is not None:
                     QUEUE_EVENT.set()
 
 
