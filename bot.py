@@ -6,9 +6,10 @@ import logging
 import os
 import shutil
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 import aiofiles
 from aiohttp import web
@@ -44,8 +45,9 @@ from utils import (
 
 LOGGER = logging.getLogger(__name__)
 DATA_DIR = Path(os.getenv("WORK_DIR", "data")).resolve()
-DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", "4"))
-MERGE_CONCURRENCY = int(os.getenv("MERGE_CONCURRENCY", "2"))
+# Force fully-serial processing for file merges.
+DOWNLOAD_CONCURRENCY = 1
+MERGE_CONCURRENCY = 1
 KEEP_FILES = os.getenv("KEEP_FILES", "0") == "1"
 PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
@@ -59,11 +61,31 @@ class MergeStates(StatesGroup):
     waiting_name = State()
 
 
+@dataclass
+class QueuedTelegramMergeJob:
+    queue_id: int
+    chat_id: int
+    video_id: str
+    audio_id: str
+    video_name: str
+    audio_name: str
+    output_name: str
+
+
 router = Router()
 ACTIVE_TASKS: Dict[int, List[asyncio.Task]] = defaultdict(list)
 ACTIVE_TRACKERS: Dict[int, List[ProgressTracker]] = defaultdict(list)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 MERGE_SEMAPHORE = asyncio.Semaphore(MERGE_CONCURRENCY)
+
+MERGE_QUEUE: Deque[QueuedTelegramMergeJob] = deque()
+QUEUE_LOCK = asyncio.Lock()
+QUEUE_EVENT = asyncio.Event()
+QUEUE_NEXT_ID = 1
+RUNNING_QUEUE_JOB: Optional[QueuedTelegramMergeJob] = None
+RUNNING_QUEUE_TASK: Optional[asyncio.Task] = None
+QUEUE_WORKER_TASK: Optional[asyncio.Task] = None
+QUEUE_SHUTTING_DOWN = False
 
 
 def track_task(chat_id: int, task: asyncio.Task) -> None:
@@ -81,6 +103,71 @@ def track_task(chat_id: int, task: asyncio.Task) -> None:
             LOGGER.exception("Background task failed", exc_info=exc)
 
     task.add_done_callback(_cleanup)
+
+
+async def enqueue_telegram_merge(job: QueuedTelegramMergeJob) -> int:
+    async with QUEUE_LOCK:
+        MERGE_QUEUE.append(job)
+        position = len(MERGE_QUEUE)
+        if RUNNING_QUEUE_JOB is not None:
+            position += 1
+        QUEUE_EVENT.set()
+        return position
+
+
+async def build_queued_merge_job(
+    chat_id: int,
+    video_id: str,
+    audio_id: str,
+    video_name: str,
+    audio_name: str,
+    output_name: str,
+) -> QueuedTelegramMergeJob:
+    global QUEUE_NEXT_ID
+    async with QUEUE_LOCK:
+        queue_id = QUEUE_NEXT_ID
+        QUEUE_NEXT_ID += 1
+    return QueuedTelegramMergeJob(
+        queue_id=queue_id,
+        chat_id=chat_id,
+        video_id=video_id,
+        audio_id=audio_id,
+        video_name=video_name,
+        audio_name=audio_name,
+        output_name=output_name,
+    )
+
+
+async def queue_counts(chat_id: int) -> tuple[int, int]:
+    async with QUEUE_LOCK:
+        running = 1 if RUNNING_QUEUE_JOB and RUNNING_QUEUE_JOB.chat_id == chat_id else 0
+        queued = sum(1 for item in MERGE_QUEUE if item.chat_id == chat_id)
+        return running, queued
+
+
+async def prune_queued_jobs(chat_id: int) -> int:
+    async with QUEUE_LOCK:
+        before = len(MERGE_QUEUE)
+        kept = deque(item for item in MERGE_QUEUE if item.chat_id != chat_id)
+        removed = before - len(kept)
+        MERGE_QUEUE.clear()
+        MERGE_QUEUE.extend(kept)
+        if not MERGE_QUEUE and RUNNING_QUEUE_JOB is None:
+            QUEUE_EVENT.clear()
+        return removed
+
+
+async def cancel_running_job_for_chat(chat_id: int) -> bool:
+    async with QUEUE_LOCK:
+        if (
+            RUNNING_QUEUE_JOB is None
+            or RUNNING_QUEUE_JOB.chat_id != chat_id
+            or RUNNING_QUEUE_TASK is None
+            or RUNNING_QUEUE_TASK.done()
+        ):
+            return False
+        RUNNING_QUEUE_TASK.cancel()
+        return True
 
 
 def is_video_document(document: types.Document) -> bool:
@@ -230,6 +317,45 @@ async def process_single_merge_with_name(
             shutil.rmtree(job_dir, ignore_errors=True)
 
 
+async def merge_queue_worker(bot: Bot) -> None:
+    global RUNNING_QUEUE_JOB, RUNNING_QUEUE_TASK
+    while True:
+        await QUEUE_EVENT.wait()
+        async with QUEUE_LOCK:
+            if not MERGE_QUEUE:
+                QUEUE_EVENT.clear()
+                continue
+            job = MERGE_QUEUE.popleft()
+            RUNNING_QUEUE_JOB = job
+            if not MERGE_QUEUE:
+                QUEUE_EVENT.clear()
+        try:
+            RUNNING_QUEUE_TASK = asyncio.create_task(
+                process_single_merge_with_name(
+                    bot=bot,
+                    chat_id=job.chat_id,
+                    video_id=job.video_id,
+                    audio_id=job.audio_id,
+                    video_name=job.video_name,
+                    audio_name=job.audio_name,
+                    output_name=job.output_name,
+                )
+            )
+            await RUNNING_QUEUE_TASK
+        except asyncio.CancelledError:
+            if QUEUE_SHUTTING_DOWN:
+                raise
+            LOGGER.info("Queued merge job %s was cancelled.", job.queue_id)
+        except Exception as exc:
+            LOGGER.exception("Queued merge job %s failed", job.queue_id, exc_info=exc)
+        finally:
+            RUNNING_QUEUE_TASK = None
+            async with QUEUE_LOCK:
+                RUNNING_QUEUE_JOB = None
+                if MERGE_QUEUE:
+                    QUEUE_EVENT.set()
+
+
 async def process_link_job(
     bot: Bot,
     chat_id: int,
@@ -348,70 +474,123 @@ async def process_link_jobs(bot: Bot, message: types.Message, jobs: List[LinkJob
 
 @router.message(Command("single"))
 async def cmd_single(message: types.Message, state: FSMContext) -> None:
+    await state.set_data({"mode": "single"})
     await state.set_state(MergeStates.waiting_audio)
-    await message.answer("🎵 **Step 1/3**: Please send the **Audio** file.")
+    await message.answer("\U0001F3B5 **Step 1/3**: Please send the **Audio** file.")
+
+
+@router.message(Command("batch"))
+async def cmd_batch(message: types.Message, state: FSMContext) -> None:
+    await state.set_data({"mode": "batch", "batch_items": []})
+    await state.set_state(MergeStates.waiting_audio)
+    await message.answer(
+        "Batch mode started.\n"
+        "Send jobs as Audio -> Video -> Output Name.\n"
+        "Send /done when finished.\n\n"
+        "\U0001F3B5 **Step 1/3**: Please send the **Audio** file."
+    )
+
+
+@router.message(Command("done"))
+async def cmd_done(message: types.Message, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("No active /batch flow. Use /batch to start.")
+        return
+
+    data = await state.get_data()
+    if data.get("mode") != "batch":
+        await message.answer("/done only works in /batch mode.")
+        return
+
+    items = data.get("batch_items", [])
+    if not items:
+        await message.answer("No completed batch items yet. Add at least one job before /done.")
+        return
+
+    if current_state != MergeStates.waiting_audio:
+        await message.answer("In-progress item is incomplete and will be skipped.")
+
+    await state.clear()
+    await message.answer(f"Queued {len(items)} item(s). Processing will run one-by-one.")
+
+    for item in items:
+        job = await build_queued_merge_job(
+            chat_id=message.chat.id,
+            video_id=item["video_id"],
+            audio_id=item["audio_id"],
+            video_name=item["video_name"],
+            audio_name=item["audio_name"],
+            output_name=item["output_name"],
+        )
+        position = await enqueue_telegram_merge(job)
+        if position == 1:
+            await message.answer(
+                "\u2705 Starting merge for **{}**. Progress shown below.".format(item["output_name"])
+            )
+        else:
+            await message.answer(
+                "\U0001F552 Queued **{}** at position **{}**.".format(item["output_name"], position)
+            )
 
 
 async def start_audio_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
     await state.update_data(audio_id=file_id, audio_name=name)
     await state.set_state(MergeStates.waiting_video)
-    await message.answer("📹 **Step 2/3**: Audio received. Now send the **Video** file.")
+    await message.answer("\U0001F4F9 **Step 2/3**: Audio received. Now send the **Video** file.")
 
 
 async def start_video_flow(message: types.Message, state: FSMContext, file_id: str, name: str) -> None:
     await state.update_data(video_id=file_id, video_name=name)
     await state.set_state(MergeStates.waiting_name)
-    await message.answer("✏️ **Step 3/3**: Video received. Now send the **Output Name** for your file (e.g. MyVideo).")
+    await message.answer("\u270F\uFE0F **Step 3/3**: Video received. Now send the **Output Name** for your file (e.g. MyVideo).")
 
 
 @router.message(CommandStart())
 async def cmd_start(message: types.Message) -> None:
     await message.answer(
-        "🚀 <b>Telegram Multi-Merger Bot</b>\n\n"
-        "I can merge video and audio without re-encoding!\n\n"
-        "🔹 <b>/single</b> — Merge one pair step-by-step.\n"
-        "🔹 <b>/links</b> — Batch merge using links.txt.\n\n"
-        "⚙️ <b>Settings</b>\n"
-        "🔹 <b>/setchannel</b> <code>ID</code> — Set destination channel.\n"
-        "🔹 <b>/channel</b> — Show current destination.\n"
-        "🔹 <b>/removechannel</b> — Reset to Private Chat.\n\n"
-        "📊 <b>Other</b>\n"
-        "🔹 <b>/status</b> — Check active jobs.\n"
-        "🔹 <b>/stop</b> — Stop all active jobs."
+        "\U0001F680 <b>Telegram Multi-Merger Bot</b>\n\n"
+        "I can merge video and audio without re-encoding.\n\n"
+        "\U0001F539 <b>/single</b> - One interactive merge (Audio -> Video -> Name).\n"
+        "\U0001F539 <b>/batch</b> - Keep adding jobs in 3 steps until <b>/done</b>.\n"
+        "\U0001F539 <b>/links</b> - Batch merge using links.txt.\n\n"
+        "\u2699\uFE0F <b>Settings</b>\n"
+        "\U0001F539 <b>/setchannel</b> <code>ID</code> - Set destination channel.\n"
+        "\U0001F539 <b>/channel</b> - Show current destination.\n"
+        "\U0001F539 <b>/removechannel</b> - Reset to private chat.\n\n"
+        "\U0001F4CA <b>Other</b>\n"
+        "\U0001F539 <b>/status</b> - Check running and queued jobs.\n"
+        "\U0001F539 <b>/stop</b> - Cancel running jobs and clear queue.\n"
+        "\U0001F539 <b>/cancel</b> - Clear current input flow."
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message) -> None:
     text = (
-        "📖 <b>Telegram Merger Bot — Complete Guide</b>\n\n"
-        "I am a powerful media processing bot that can merge Video and Audio files without re-encoding, preserving 100% of the original quality.\n\n"
-        
-        "🛠 <b>Core Functions</b>\n"
+        "\U0001F4D6 <b>Telegram Merger Bot - Guide</b>\n\n"
+        "Core commands:\n"
         "<blockquote>"
-        "🔹 <b>/single</b> — Start a step-by-step merge. I'll ask for audio, then video, then a name.\n"
-        "🔹 <b>/links</b> — Show instructions for Batch Mode processing.\n"
+        "\U0001F539 <b>/single</b> - One merge in 3 steps.\n"
+        "\U0001F539 <b>/batch</b> - Keep adding jobs in 3 steps, then send <b>/done</b>.\n"
+        "\U0001F539 <b>/links</b> - Batch mode from links text or file.\n"
+        "\U0001F539 <b>/cancel</b> - Reset current conversation flow.\n"
         "</blockquote>\n"
-
-        "⚙️ <b>Channel Destinations</b>\n"
-        "<i>You can send merged files to any channel where I am an Admin.</i>\n"
+        "Queue behavior:\n"
         "<blockquote>"
-        "🔹 <b>/setchannel</b> <code>[ID/@User]</code> — Set target channel.\n"
-        "🔹 <b>/channel</b> — Verify current destination.\n"
-        "🔹 <b>/removechannel</b> — Reset to Private Chat."
+        "Only one merge job runs at a time. Remaining jobs are queued and processed in order."
         "</blockquote>\n"
-
-        "📊 <b>Management</b>\n"
+        "Destination commands:\n"
         "<blockquote>"
-        "🔹 <b>/status</b> — Detailed real-time view of all active jobs.\n"
-        "🔹 <b>/stop</b> — Kill all background tasks and clean up.\n"
-        "🔹 <b>/cancel</b> — Reset the current /single flow."
-        "</blockquote>\n\n"
-
-        "💡 <b>Pro Tips:</b>\n"
-        "• Paste the <code>links.txt</code> content directly in chat for instant batching.\n"
-        "• Files up to <b>2GB</b> are supported via Pyrogram.\n"
-        "• Use <code>/status</code> if you lose a progress message."
+        "\U0001F539 <b>/setchannel</b> <code>[ID/@User]</code>\n"
+        "\U0001F539 <b>/channel</b>\n"
+        "\U0001F539 <b>/removechannel</b>"
+        "</blockquote>\n"
+        "Monitoring:\n"
+        "<blockquote>"
+        "\U0001F539 <b>/status</b> - Running + queued overview.\n"
+        "\U0001F539 <b>/stop</b> - Cancel running jobs and clear your queue."
+        "</blockquote>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -438,23 +617,29 @@ async def cmd_status(message: types.Message) -> None:
     chat_id = message.chat.id
     tasks = ACTIVE_TASKS.get(chat_id, [])
     trackers = ACTIVE_TRACKERS.get(chat_id, [])
-    
-    if not tasks:
-        await message.answer("✅ <b>No active jobs</b> for this chat.")
+    running_queue, queued_queue = await queue_counts(chat_id)
+
+    if not tasks and not trackers and not running_queue and not queued_queue:
+        await message.answer("\u2705 <b>No active jobs</b> for this chat.")
         return
-    
+
     try:
         import psutil
-        usage = f"🖥 <b>System Load</b>: {psutil.cpu_percent()}% | <b>RAM</b>: {psutil.virtual_memory().percent}%"
+
+        usage = (
+            f"\U0001F5A5 <b>System Load</b>: {psutil.cpu_percent()}% | "
+            f"<b>RAM</b>: {psutil.virtual_memory().percent}%"
+        )
     except ImportError:
-        usage = "🖥 System tracking not available"
+        usage = "\U0001F5A5 System tracking not available"
 
     text = (
-        f"📊 <b>Detailed Status for {message.from_user.first_name}</b>\n"
-        f"🏃 <b>Active Processes</b>: {len(tasks)}\n"
+        f"\U0001F4CA <b>Detailed Status for {message.from_user.first_name}</b>\n"
+        f"\U0001F3C3 <b>Active Processes</b>: {len(tasks) + running_queue}\n"
+        f"\U0001F9FE <b>Queued Items</b>: {queued_queue}\n"
         f"{usage}\n\n"
     )
-    
+
     for tracker in trackers:
         text += tracker.render() + "\n"
 
@@ -463,18 +648,27 @@ async def cmd_status(message: types.Message) -> None:
 
 @router.message(Command("stop"))
 async def cmd_stop(message: types.Message) -> None:
-    # ... (existing stop logic) ...
     chat_id = message.chat.id
     tasks = ACTIVE_TASKS.get(chat_id, [])
-    if not tasks:
-        await message.answer("No active jobs found for this chat.")
-        return
-    
-    count = len(tasks)
+
+    cancelled_tasks = 0
     for task in tasks:
         task.cancel()
-    
-    await message.answer(f"Cancelled {count} active job(s). Cleanup might take a few seconds.")
+        cancelled_tasks += 1
+
+    removed_queue = await prune_queued_jobs(chat_id)
+    cancelled_running_queue = await cancel_running_job_for_chat(chat_id)
+
+    total = cancelled_tasks + removed_queue + (1 if cancelled_running_queue else 0)
+    if total == 0:
+        await message.answer("No active jobs found for this chat.")
+        return
+
+    await message.answer(
+        f"Cancelled {cancelled_tasks} active task(s), "
+        f"removed {removed_queue} queued item(s), "
+        f"running queued job cancelled: {'yes' if cancelled_running_queue else 'no'}."
+    )
 
 
 @router.message(Command("setchannel"))
@@ -545,7 +739,7 @@ async def handle_audio(message: types.Message, state: FSMContext) -> None:
 async def handle_video(message: types.Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     if current_state != MergeStates.waiting_video:
-        await message.answer("⚠️ Please send /single to start the merge flow correctly.")
+        await message.answer("Please send /single or /batch to start the merge flow.")
         return
     video = message.video
     name = video.file_name or f"video_{message.message_id}.mp4"
@@ -580,33 +774,53 @@ async def handle_document(message: types.Message, state: FSMContext) -> None:
         await handle_links_file(message, document)
         return
     
-    await message.answer("❓ Use /single to start merging, or send a links.txt file for batch mode.")
+    await message.answer("Use /single or /batch to start merging, or send a links.txt file for links batch.")
 
 
 @router.message(F.text)
 async def handle_text(message: types.Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     
-    # Handle the "Name" step of /single flow
+    # Handle the "Name" step of /single or /batch flow.
     if current_state == MergeStates.waiting_name:
         data = await state.get_data()
-        await state.clear()
-        
-        output_name = message.text.strip()
-        await message.answer(f"✅ Starting merge for **{output_name}**. Progress shown below.")
-        
-        task = asyncio.create_task(
-            process_single_merge_with_name(
-                message.bot, 
-                message.chat.id, 
-                data["video_id"], 
-                data["audio_id"], 
-                data["video_name"], 
-                data["audio_name"],
-                output_name
+        mode = data.get("mode", "single")
+        output_name = ensure_mp4_name(message.text.strip())
+
+        if mode == "batch":
+            items = list(data.get("batch_items", []))
+            items.append(
+                {
+                    "video_id": data["video_id"],
+                    "audio_id": data["audio_id"],
+                    "video_name": data["video_name"],
+                    "audio_name": data["audio_name"],
+                    "output_name": output_name,
+                }
             )
+            await state.set_data({"mode": "batch", "batch_items": items})
+            await state.set_state(MergeStates.waiting_audio)
+            await message.answer(
+                f"Saved item **{len(items)}** as **{output_name}**.\n"
+                "Send next audio file, or /done to start queued processing.\n\n"
+                "\U0001F3B5 **Step 1/3**: Please send the **Audio** file."
+            )
+            return
+
+        await state.clear()
+        job = await build_queued_merge_job(
+            chat_id=message.chat.id,
+            video_id=data["video_id"],
+            audio_id=data["audio_id"],
+            video_name=data["video_name"],
+            audio_name=data["audio_name"],
+            output_name=output_name,
         )
-        track_task(message.chat.id, task)
+        position = await enqueue_telegram_merge(job)
+        if position == 1:
+            await message.answer(f"\u2705 Starting merge for **{output_name}**. Progress shown below.")
+        else:
+            await message.answer(f"\U0001F552 Queued **{output_name}** at position **{position}**.")
         return
 
     # Handle Batch paste
@@ -618,7 +832,7 @@ async def handle_text(message: types.Message, state: FSMContext) -> None:
         track_task(message.chat.id, task)
         return
     
-    await message.answer("❓ Send /single to start a merge or /links for batch mode.")
+    await message.answer("Send /single or /batch for guided mode, or /links for links-based batch mode.")
 
 
 async def handle_links_file(message: types.Message, document: types.Document) -> None:
@@ -702,10 +916,23 @@ def main() -> None:
             LOGGER.exception("CRITICAL: Failed to set webhook to %s", webhook_full, exc_info=exc)
 
     async def on_startup(*_args, **_kwargs) -> None:
+        global QUEUE_WORKER_TASK, QUEUE_SHUTTING_DOWN
+        QUEUE_SHUTTING_DOWN = False
         asyncio.create_task(_set_webhook_background())
+        if QUEUE_WORKER_TASK is None or QUEUE_WORKER_TASK.done():
+            QUEUE_WORKER_TASK = asyncio.create_task(merge_queue_worker(bot))
 
     async def on_shutdown(*_args, **_kwargs) -> None:
+        global QUEUE_WORKER_TASK, QUEUE_SHUTTING_DOWN
         LOGGER.info("Shutting down...")
+        QUEUE_SHUTTING_DOWN = True
+        if QUEUE_WORKER_TASK is not None:
+            QUEUE_WORKER_TASK.cancel()
+            try:
+                await QUEUE_WORKER_TASK
+            except asyncio.CancelledError:
+                pass
+            QUEUE_WORKER_TASK = None
         await bot.session.close()
 
     dp.startup.register(on_startup)
@@ -729,3 +956,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

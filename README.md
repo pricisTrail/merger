@@ -4,8 +4,9 @@ A **Bot API** Telegram bot that merges a video + audio without re-encoding (ffmp
 
 ## Features
 - Video + audio merge without quality loss (`-c copy`).
+- Guided `/batch` mode: Audio -> Video -> Output Name loop until `/done`.
 - Batch jobs via `links.txt`.
-- Parallel downloads with per-job pairing guarantees.
+- Serial processing queue (one merge job at a time).
 - Live progress for download/merge/upload.
 - Uses **yt-dlp** and prefers **aria2c** if installed.
 
@@ -67,6 +68,13 @@ Notes:
 2. Send an **audio** file.
 
 The bot downloads both, merges without re-encoding, and uploads the result.
+
+### Guided batch merge (`/batch`)
+1. Send `/batch`.
+2. Repeat this for each item: Audio -> Video -> Output Name.
+3. Send `/done`.
+
+All queued items are processed one-by-one in order.
 
 ### Batch merge (`links.txt`)
 Send `/links`, then upload a text file formatted like:
