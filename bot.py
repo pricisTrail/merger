@@ -229,7 +229,6 @@ async def process_single_merge(
     tracker = ProgressTracker(bot, chat_id, "Single merge")
     tracker.add_job(1, output_name)
     ACTIVE_TRACKERS[chat_id].append(tracker)
-    await tracker.start()
 
     # Prefix filenames to prevent collision when video and audio have same name
     video_path = job_dir / safe_filename(f"v_{video_name}" if video_name else f"v_video_{job_id}.mp4")
@@ -249,6 +248,7 @@ async def process_single_merge(
         await tracker.update(1, upload=text)
 
     try:
+        await tracker.start()
         await tracker.update(1, video="starting", audio="starting")
         await asyncio.gather(
             download_telegram_file(bot, video_id, video_path, DOWNLOAD_SEMAPHORE, video_cb),
@@ -288,7 +288,6 @@ async def process_single_merge_with_name(
     tracker = ProgressTracker(bot, chat_id, "Single Merge")
     tracker.add_job(1, output_name)
     ACTIVE_TRACKERS[chat_id].append(tracker)
-    await tracker.start()
 
     # Prefix filenames to prevent collision when video and audio have same name
     video_path = job_dir / safe_filename(f"v_{video_name}")
@@ -312,6 +311,7 @@ async def process_single_merge_with_name(
     dest = settings.get("target_channel")
 
     try:
+        await tracker.start()
         await tracker.update(1, video="starting", audio="starting")
         await asyncio.gather(
             download_telegram_file(bot, video_id, video_path, DOWNLOAD_SEMAPHORE, video_cb),
@@ -499,14 +499,16 @@ async def process_link_jobs(bot: Bot, message: types.Message, jobs: List[LinkJob
     ACTIVE_TRACKERS[message.chat.id].append(tracker)
     for job in jobs:
         tracker.add_job(job.index, job.name)
-    await tracker.start()
-    tasks = [
-        asyncio.create_task(process_link_job(bot, message.chat.id, job, tracker, external_downloader))
-        for job in jobs
-    ]
-    await asyncio.gather(*tasks)
-    if tracker in ACTIVE_TRACKERS[message.chat.id]:
-        ACTIVE_TRACKERS[message.chat.id].remove(tracker)
+    try:
+        await tracker.start()
+        tasks = [
+            asyncio.create_task(process_link_job(bot, message.chat.id, job, tracker, external_downloader))
+            for job in jobs
+        ]
+        await asyncio.gather(*tasks)
+    finally:
+        if tracker in ACTIVE_TRACKERS[message.chat.id]:
+            ACTIVE_TRACKERS[message.chat.id].remove(tracker)
 
 
 @router.message(Command("single"))
@@ -655,6 +657,26 @@ async def cmd_status(message: types.Message) -> None:
     tasks = ACTIVE_TASKS.get(chat_id, [])
     trackers = ACTIVE_TRACKERS.get(chat_id, [])
     running_queue, queued_queue = await queue_counts(chat_id)
+
+    # Clean up stale trackers left behind by previously failed progress-message setup.
+    if not tasks and not running_queue and not queued_queue and trackers:
+        filtered_trackers: List[ProgressTracker] = []
+        for tracker in trackers:
+            jobs = list(tracker.jobs.values())
+            if not jobs:
+                continue
+            if all(
+                job.video == "queued"
+                and job.audio == "queued"
+                and job.merge == "queued"
+                and job.upload == "queued"
+                for job in jobs
+            ):
+                continue
+            filtered_trackers.append(tracker)
+        if len(filtered_trackers) != len(trackers):
+            ACTIVE_TRACKERS[chat_id] = filtered_trackers
+            trackers = filtered_trackers
 
     if not tasks and not trackers and not running_queue and not queued_queue:
         await message.answer("\u2705 <b>No active jobs</b> for this chat.")

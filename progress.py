@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 EDIT_THROTTLE_SECONDS = 1.0
 MAX_PROGRESS_LINES = 20
+START_RETRY_SECONDS = 5.0
+LOGGER = logging.getLogger(__name__)
 
 def get_premium_status(stage: str, text: str) -> str:
     """Parses standard status text and returns a beautified text card."""
@@ -72,16 +75,29 @@ class ProgressTracker:
         self.jobs: "OrderedDict[int, JobStatus]" = OrderedDict()
         self._lock = asyncio.Lock()
         self._last_edit = 0.0
+        self._start_retry_after = 0.0
         self.current_page = 0 # 0-indexed
 
     async def start(self) -> None:
         if self.message_id is not None:
             return
-        message = await self.bot.send_message(
-            self.chat_id, 
-            self.render(), 
-            reply_markup=self.get_markup()
-        )
+        now = time.monotonic()
+        if now < self._start_retry_after:
+            return
+        try:
+            message = await self.bot.send_message(
+                self.chat_id,
+                self.render(),
+                reply_markup=self.get_markup()
+            )
+        except Exception as exc:
+            self._start_retry_after = time.monotonic() + START_RETRY_SECONDS
+            LOGGER.warning(
+                "Progress tracker start failed for chat %s; retrying: %s",
+                self.chat_id,
+                exc,
+            )
+            return
         self.message_id = message.message_id
 
     def add_job(self, job_id: int, name: str) -> None:
@@ -96,6 +112,8 @@ class ProgressTracker:
     async def refresh(self, force: bool = False) -> None:
         if self.message_id is None:
             await self.start()
+            if self.message_id is None:
+                return
         async with self._lock:
             now = time.monotonic()
             if not force and now - self._last_edit < EDIT_THROTTLE_SECONDS:
@@ -109,8 +127,25 @@ class ProgressTracker:
                     reply_markup=self.get_markup()
                 )
             except TelegramBadRequest as exc:
-                if "message is not modified" not in str(exc).lower():
-                    raise
+                error_text = str(exc).lower()
+                if "message is not modified" in error_text:
+                    pass
+                else:
+                    # Message can disappear (deleted, not editable). Continue job and retry later.
+                    if "message to edit not found" in error_text or "message can't be edited" in error_text:
+                        self.message_id = None
+                        self._start_retry_after = time.monotonic() + START_RETRY_SECONDS
+                    LOGGER.warning(
+                        "Progress tracker edit issue for chat %s: %s",
+                        self.chat_id,
+                        exc,
+                    )
+            except Exception as exc:
+                LOGGER.warning(
+                    "Progress tracker edit failed for chat %s; continuing: %s",
+                    self.chat_id,
+                    exc,
+                )
             self._last_edit = time.monotonic()
 
     def render(self) -> str:
