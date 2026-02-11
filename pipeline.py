@@ -583,7 +583,7 @@ async def upload_with_progress(
                 await progress_cb(f"failed: {str(e)}")
             raise e
 
-    # Use Pyrogram for large files
+    # Use Pyrogram for large files (reuse shared client)
     try:
         if progress_cb:
             await progress_cb("preparing metadata")
@@ -596,31 +596,56 @@ async def upload_with_progress(
         width = info.get("width", 0)
         height = info.get("height", 0)
 
-        async with Client(
-            name=f"uploader_{chat_id}",
-            api_id=int(api_id),
-            api_hash=api_hash,
-            bot_token=bot_token,
-            in_memory=True,
-        ) as app:
+        # Reuse shared Pyrogram client instead of creating a new one per upload
+        app = await _get_pyrogram_client(bot)
+
+        if progress_cb:
+            await progress_cb("uploading")
+
+        # Throttle upload progress to avoid flooding Telegram with EditMessage calls
+        upload_last_emit = 0.0
+        upload_start = time.monotonic()
+
+        async def pyrogram_progress(current, total):
+            nonlocal upload_last_emit
+            now = time.monotonic()
+            if now - upload_last_emit < 2.0:  # 2 second throttle for uploads
+                return
             if progress_cb:
-                await progress_cb("uploading")
+                elapsed = max(now - upload_start, 0.001)
+                speed = current / elapsed
+                await progress_cb(format_progress("uploading", current, total, speed))
+            upload_last_emit = now
 
-            async def pyrogram_progress(current, total):
-                if progress_cb:
-                    await progress_cb(format_progress("uploading", current, total, None))
-
-            await app.send_video(
-                chat_id=target_chat,
-                video=str(video_path),
-                caption=caption,
-                supports_streaming=True,
-                duration=duration,
-                width=width,
-                height=height,
-                thumb=str(thumb_path) if thumb_path else None,
-                progress=pyrogram_progress
-            )
+        # Retry on FloodWait for the actual upload
+        max_upload_retries = 3
+        for attempt in range(1, max_upload_retries + 1):
+            try:
+                await app.send_video(
+                    chat_id=target_chat,
+                    video=str(video_path),
+                    caption=caption,
+                    supports_streaming=True,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=str(thumb_path) if thumb_path else None,
+                    progress=pyrogram_progress
+                )
+                break  # Success
+            except Exception as upload_exc:
+                if "FLOOD_WAIT" in str(upload_exc):
+                    match = re.search(r'(\d+) seconds', str(upload_exc))
+                    wait_time = int(match.group(1)) if match else 60
+                    if wait_time > 600:  # More than 10 minutes, don't wait
+                        raise upload_exc
+                    LOGGER.warning("Upload FloodWait: sleeping %ds (attempt %d/%d)",
+                                   wait_time, attempt, max_upload_retries)
+                    if progress_cb:
+                        await progress_cb(f"rate limited, waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time + 5)
+                else:
+                    raise upload_exc
             
         if thumb_path:
             thumb_path.unlink(missing_ok=True)

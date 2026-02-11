@@ -11,7 +11,7 @@ from aiogram import Bot, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-EDIT_THROTTLE_SECONDS = 1.0
+EDIT_THROTTLE_SECONDS = 2.0        # Minimum gap between edit_message_text calls
 MAX_PROGRESS_LINES = 20
 START_RETRY_SECONDS = 5.0
 LOGGER = logging.getLogger(__name__)
@@ -141,6 +141,27 @@ class ProgressTracker:
                         exc,
                     )
             except Exception as exc:
+                exc_str = str(exc)
+                # Detect FloodWait and back off for the required time
+                if "flood" in exc_str.lower() or "retry after" in exc_str.lower():
+                    import re as _re
+                    match = _re.search(r'(\d+)\s*(?:seconds?)?', exc_str)
+                    wait_secs = int(match.group(1)) if match else 30
+                    # Clamp to max 5 minutes - don't hold up forever
+                    wait_secs = min(wait_secs, 300)
+                    LOGGER.warning(
+                        "Progress tracker edit failed for chat %s; "
+                        "backing off %ds: %s\nOriginal description: %s\n"
+                        "(background on this error at: "
+                        "https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this)",
+                        self.chat_id,
+                        wait_secs,
+                        exc,
+                        exc_str,
+                    )
+                    # Prevent any further edits until the wait expires
+                    self._last_edit = time.monotonic() + wait_secs
+                    return
                 LOGGER.warning(
                     "Progress tracker edit failed for chat %s; continuing: %s",
                     self.chat_id,
